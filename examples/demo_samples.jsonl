@@ -1,0 +1,12 @@
+{"id": "train-a1", "split": "train", "text": "今天天气晴朗，我们决定去公园散步，沿途欣赏盛开的樱花。"}
+{"id": "train-a2", "split": "train", "text": "今天天气晴朗，我们决定去公园散步，沿途欣赏盛开的樱花。"}
+{"id": "val-a3", "split": "validation", "text": "今天天气晴朗，我们决定去公园散步，沿途欣赏盛开的樱花。"}
+{"id": "train-b1", "split": "train", "text": "该模型通过引入注意力机制，显著提升了长文本任务的表现，训练速度也更快。"}
+{"id": "val-b2", "split": "validation", "text": "通过引入注意力机制，该模型显著提升了长文本任务上的表现，而且训练速度更快。"}
+{"id": "train-c1", "split": "train", "text": "操作系统内核负责调度进程、管理内存，并向用户程序提供统一的系统调用接口。"}
+{"id": "val-c2", "split": "validation", "text": "备注：本季度评审会议改期。系统调用接口的定义请参见附录第三页。"}
+{"id": "train-d1", "split": "train", "text": "海边的日落把云层染成橘红色，几只海鸥从灯塔上方缓缓飞过。"}
+{"id": "val-d2", "split": "validation", "text": "量子纠缠无法超光速传递信息，测量结果的相关性需要经典信道才能验证。"}
+{"id": "train-chain-a", "split": "train", "text": "word00 word01 word02 word03 word04 word05 word06 word07 word08 word09 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29"}
+{"id": "train-chain-b", "split": "train", "text": "word03 word04 word05 word06 word07 word08 word09 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32"}
+{"id": "val-chain-c", "split": "validation", "text": "word06 word07 word08 word09 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32 word33 word34 word35"}
