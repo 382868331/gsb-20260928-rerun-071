@@ -50,6 +50,8 @@ def _clique_compatible(
 def complete_link_groups(
     sample_ids: list[str],
     edges: list[tuple[str, str, float]],
+    excluded_edges: set[tuple[str, str]] | None = None,
+    prior_groups: list[list[str]] | None = None,
 ) -> list[list[str]]:
     """强边优先的完全连接凝聚聚类，输出成员 >=2 的组。
 
@@ -57,15 +59,33 @@ def complete_link_groups(
     仍由调用方保留作为证据。
     """
 
+    excluded = {_canonical_pair(*pair) for pair in (excluded_edges or set())}
     adjacency: dict[str, set[str]] = {sid: set() for sid in sample_ids}
     for left_id, right_id, _ in edges:
+        if _canonical_pair(left_id, right_id) in excluded:
+            continue
         adjacency[left_id].add(right_id)
         adjacency[right_id].add(left_id)
 
     groups: list[set[str]] = []
     owner: dict[str, int] = {}
 
+    if prior_groups is not None:
+        for group in prior_groups:
+            members = set(group)
+            if any(
+                _canonical_pair(left_id, right_id) in excluded
+                for left_id, right_id in combinations(sorted(members), 2)
+            ):
+                continue
+            index = len(groups)
+            groups.append(members)
+            for member in members:
+                owner[member] = index
+
     for left_id, right_id, _ in edges:
+        if _canonical_pair(left_id, right_id) in excluded:
+            continue
         left_group = owner.get(left_id)
         right_group = owner.get(right_id)
 
@@ -105,3 +125,7 @@ def _groups_can_merge(
     return all(
         _clique_compatible(node, group_b, adjacency) for node in group_a
     )
+
+
+def _canonical_pair(left_id: str, right_id: str) -> tuple[str, str]:
+    return tuple(sorted((left_id, right_id)))  # type: ignore[return-value]

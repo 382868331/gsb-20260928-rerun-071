@@ -143,3 +143,155 @@ def test_cli_end_to_end(tmp_path):
     assert len(conclusion["leakages"]) == 3
     # 原始样本文件没有被审查流程改动。
     assert len((store_dir / "versions" / "v1" / "samples.jsonl").read_text("utf-8").strip().splitlines()) == 9
+
+
+def test_incremental_bridge_keeps_old_identities_and_local_edges():
+    samples = [
+        Sample("a", "train", "a", "ha"),
+        Sample("b", "train", "b", "hb"),
+        Sample("c", "val", "c", "hc"),
+        Sample("d", "val", "d", "hd"),
+        Sample("x", "train", "x", "hx"),
+    ]
+    shingles = {
+        "a": {"g1", "g2", "g3"},
+        "b": {"g1", "g2", "g3", "b1", "b2"},
+        "c": {"g4", "g5", "g6", "c1", "c2"},
+        "d": {"g4", "g5", "g6"},
+        "x": {"b1", "b2", "c1", "c2"},
+    }
+    prior = run_near_duplicate_rule(
+        samples[:4], shingles, audit_id="old", version_id="v-old", threshold=0.25
+    )
+    revised = run_near_duplicate_rule(
+        samples,
+        shingles,
+        audit_id="new",
+        version_id="v-new",
+        prior_conclusion=prior,
+        threshold=0.25,
+    )
+    full_rerun = run_near_duplicate_rule(
+        samples,
+        shingles,
+        audit_id="full",
+        version_id="v-new",
+        threshold=0.25,
+    )
+
+    assert ["a", "b"] in revised.groups
+    assert ["c", "d"] in revised.groups
+    assert not any({"a", "b", "c", "d", "x"} <= set(group) for group in revised.groups)
+    bridge_roles = {
+        (edge["sample_a"], edge["sample_b"]): edge["evidence_role"]
+        for edge in revised.edges
+    }
+    assert bridge_roles[("b", "x")] == "local_similarity"
+    assert bridge_roles[("c", "x")] == "local_similarity"
+    assert {"a", "b"} in [set(item["members"]) for item in revised.changes["groups"] if item["status"] == "unchanged"]
+    assert full_rerun.groups == revised.groups
+    assert full_rerun.leakages == revised.leakages
+
+
+def test_manual_exclusion_blocks_identity_but_preserves_leakage(audited):
+    samples, _, prior = audited
+    _, shingle_sets = fingerprint_samples(samples, "v-test")
+    exclusions = [
+        {"sample_a": "c2", "sample_b": "c3", "status": "active", "decision_id": "m1"}
+    ]
+    revised = run_near_duplicate_rule(
+        samples,
+        shingle_sets,
+        audit_id="a-manual",
+        version_id="v-test",
+        prior_conclusion=prior,
+        manual_exclusions=exclusions,
+    )
+
+    assert not any({"c2", "c3"} <= set(group) for group in revised.groups)
+    edge = next(
+        edge for edge in revised.edges
+        if {edge["sample_a"], edge["sample_b"]} == {"c2", "c3"}
+    )
+    assert edge["manual_identity_excluded"] is True
+    assert edge["evidence_role"] == "local_similarity"
+    assert ("c2", "c3") in {
+        (item["sample_a"], item["sample_b"]) for item in revised.leakages
+    }
+    assert revised.manual_exclusions[0]["decision_id"] == "m1"
+
+
+def test_revoked_manual_exclusion_can_rebuild_original_group(audited):
+    samples, _, _ = audited
+    _, shingle_sets = fingerprint_samples(samples, "v-test")
+    revised = run_near_duplicate_rule(
+        samples,
+        shingle_sets,
+        audit_id="a-revoked",
+        version_id="v-test",
+        manual_exclusions=[
+            {"sample_a": "c2", "sample_b": "c3", "status": "revoked"}
+        ],
+    )
+    assert ["c1", "c2"] in revised.groups
+    edge = next(
+        edge for edge in revised.edges
+        if {edge["sample_a"], edge["sample_b"]} == {"c2", "c3"}
+    )
+    assert edge["manual_identity_excluded"] is False
+    assert not revised.manual_exclusions
+
+
+def test_increment_copies_base_and_preserves_original_version(tmp_path):
+    store = AuditStore(tmp_path / "store")
+    samples = load_dataset(SAMPLE_DATA)
+    fingerprints, _ = fingerprint_samples(samples, "v1")
+    store.save_version("v1", samples, fingerprints)
+    added = tmp_path / "added.jsonl"
+    added.write_text(
+        json.dumps(
+            {
+                "sample_id": "n1",
+                "split": "test",
+                "text": "新增测试样本，内容与旧样本完全不同，用于检查复制追加。",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store.create_version_from_base("v2", "v1", added)
+
+    assert len(store.load_samples("v1")) == 9
+    assert [sample.sample_id for sample in store.load_samples("v2")][-1:] == ["n1"]
+    assert len(store.load_fingerprints("v2")) == 10
+
+
+def test_conclusion_files_are_immutable(tmp_path, audited):
+    _, _, conclusion = audited
+    store = AuditStore(tmp_path / "store")
+    store.save_conclusion(conclusion)
+    with pytest.raises(FileExistsError):
+        store.save_conclusion(conclusion)
+
+
+def test_manual_exclusion_log_is_appendable_and_revocable(tmp_path):
+    store = AuditStore(tmp_path / "store")
+    store.append_manual_exclusion("b", "a", "t1", decision_id="m1")
+    assert store.load_manual_exclusions() == [
+        {
+            "decision_id": "m1",
+            "sample_a": "a",
+            "sample_b": "b",
+            "decision": "different_identity",
+            "status": "active",
+            "reason": "",
+            "decided_at": "t1",
+        }
+    ]
+    store.revoke_manual_exclusion("b", "a", "t2")
+    assert store.load_manual_exclusions() == []
+    log = (tmp_path / "store" / "decisions" / "manual_exclusions.jsonl").read_text("utf-8")
+    assert '"status": "active"' in log
+    assert '"status": "revoked"' in log

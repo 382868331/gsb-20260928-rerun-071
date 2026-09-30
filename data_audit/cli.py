@@ -33,6 +33,10 @@ def cmd_audit(args: argparse.Namespace) -> None:
     samples = store.load_samples(args.version_id)
     fingerprints = store.load_fingerprints(args.version_id)
     shingle_sets = {fp.sample_id: set(fp.shingles) for fp in fingerprints}
+    prior_conclusion = None
+    if args.baseline_audit_id:
+        prior_conclusion = store.load_conclusion(args.baseline_audit_id)
+    manual_exclusions = store.load_manual_exclusions()
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conclusion = run_near_duplicate_rule(
         samples=samples,
@@ -41,6 +45,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
         version_id=args.version_id,
         threshold=args.threshold,
         created_at=created_at,
+        prior_conclusion=prior_conclusion,
+        manual_exclusions=manual_exclusions,
     )
     store.save_conclusion(conclusion)
     print(
@@ -64,6 +70,45 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(render_markdown(conclusion, sample_text))
 
 
+def cmd_increment(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    samples = store.create_version_from_base(
+        args.version_id,
+        args.base_version_id,
+        args.input,
+        metadata={"source": str(args.input)},
+    )
+    print(
+        f"已创建增量完整版本 {args.version_id}：复制基线样本并追加，"
+        f"当前共 {len(samples)} 个样本；基线未改动"
+    )
+
+
+def cmd_exclude(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    decided_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = store.append_manual_exclusion(
+        args.sample_a,
+        args.sample_b,
+        decided_at=decided_at,
+        reason=args.reason,
+        decision_id=args.decision_id,
+    )
+    print(f"已记录人工不同身份判定：{record['sample_a']} != {record['sample_b']}")
+
+
+def cmd_revoke_exclusion(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    revoked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = store.revoke_manual_exclusion(
+        args.sample_a,
+        args.sample_b,
+        revoked_at=revoked_at,
+        reason=args.reason,
+    )
+    print(f"已撤回人工不同身份判定：{record['sample_a']} / {record['sample_b']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data-audit", description="训练数据审查系统")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -79,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--version-id", required=True)
     audit.add_argument("--audit-id", required=True)
     audit.add_argument("--threshold", type=float, default=0.45)
+    audit.add_argument("--baseline-audit-id", help="增量修订时使用的旧审查结论")
     audit.add_argument("--report", action="store_true", help="同时打印 Markdown 报告")
     audit.set_defaults(func=cmd_audit)
 
@@ -86,6 +132,28 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--store", required=True)
     report.add_argument("--audit-id", required=True)
     report.set_defaults(func=cmd_report)
+
+    increment = sub.add_parser("increment", help="复制基线版本并追加新增样本")
+    increment.add_argument("--store", required=True)
+    increment.add_argument("--base-version-id", required=True)
+    increment.add_argument("--version-id", required=True)
+    increment.add_argument("--input", required=True, help="仅包含新增样本的 JSONL")
+    increment.set_defaults(func=cmd_increment)
+
+    exclude = sub.add_parser("exclude", help="追加人工确认的不同身份关系")
+    exclude.add_argument("--store", required=True)
+    exclude.add_argument("--sample-a", required=True)
+    exclude.add_argument("--sample-b", required=True)
+    exclude.add_argument("--decision-id", default="")
+    exclude.add_argument("--reason", default="")
+    exclude.set_defaults(func=cmd_exclude)
+
+    revoke = sub.add_parser("revoke-exclusion", help="撤回人工不同身份关系")
+    revoke.add_argument("--store", required=True)
+    revoke.add_argument("--sample-a", required=True)
+    revoke.add_argument("--sample-b", required=True)
+    revoke.add_argument("--reason", default="")
+    revoke.set_defaults(func=cmd_revoke_exclusion)
     return parser
 
 

@@ -80,6 +80,9 @@ class Conclusion:
     edges: list[dict[str, Any]] = field(default_factory=list)
     leakages: list[dict[str, Any]] = field(default_factory=list)
     actions: list[dict[str, str]] = field(default_factory=list)
+    group_details: list[dict[str, Any]] = field(default_factory=list)
+    manual_exclusions: list[dict[str, Any]] = field(default_factory=list)
+    changes: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,5 +101,8 @@ class Conclusion:
             edges=list(data.get("edges", [])),
             leakages=list(data.get("leakages", [])),
             actions=list(data.get("actions", [])),
+            group_details=list(data.get("group_details", [])),
+            manual_exclusions=list(data.get("manual_exclusions", [])),
+            changes=dict(data.get("changes", {})),
             created_at=data.get("created_at", ""),
         )
