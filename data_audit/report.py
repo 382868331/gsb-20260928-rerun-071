@@ -28,6 +28,8 @@ def render_markdown(conclusion: Conclusion, sample_text: dict[str, str]) -> str:
     lines.append(f"# 审查报告 {conclusion.audit_id}")
     lines.append("")
     lines.append(f"- 数据版本：`{conclusion.version_id}`")
+    if conclusion.split_version_id:
+        lines.append(f"- 划分版本：`{conclusion.split_version_id}`")
     if conclusion.parent_version_id:
         lines.append(
             f"- 增量版本：父版本 `{conclusion.parent_version_id}`，"

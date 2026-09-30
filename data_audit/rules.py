@@ -175,14 +175,29 @@ def run_near_duplicate_rule(
     base_conclusion: Conclusion | None = None,
     parent_version_id: str = "",
     added_sample_ids: list[str] | None = None,
+    split_overrides: dict[str, str] | None = None,
+    split_version_id: str = "",
 ) -> Conclusion:
-    """执行 R001：近重复分组、跨划分泄漏证据、人工判定与修订差异。"""
+    """执行 R001：近重复分组、跨划分泄漏证据、人工判定与修订差异。
+
+    split_overrides 提供某个划分版本的 train/val/test 安排；相似关系
+    与人工身份判定与划分无关、跨划分版本保留，但泄漏结论按各自划分版本
+    计算并标记 split_version_id，不能跨划分版本直接沿用。
+    """
 
     decisions = decisions or []
     added_sample_ids = added_sample_ids or []
     sample_ids = sorted(sample.sample_id for sample in samples)
     sample_ids_set = set(sample_ids)
-    split_of = {sample.sample_id: sample.split for sample in samples}
+    if split_overrides is not None:
+        missing = sample_ids_set - set(split_overrides)
+        if missing:
+            raise ValueError(
+                f"划分版本缺少这些样本的安排: {sorted(missing)}"
+            )
+        split_of = {sid: split_overrides[sid] for sid in sample_ids}
+    else:
+        split_of = {sample.sample_id: sample.split for sample in samples}
     text_of = {sample.sample_id: sample.text for sample in samples}
 
     excluded_pairs: set[tuple[str, str]] = set()
@@ -277,6 +292,7 @@ def run_near_duplicate_rule(
         base_audit_id=base_audit_id,
         parent_version_id=parent_version_id,
         added_sample_ids=sorted(added_sample_ids),
+        split_version_id=split_version_id,
     )
 
 

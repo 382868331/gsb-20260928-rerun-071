@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .models import Conclusion, Decision, Fingerprint, Sample
+from .models import Conclusion, Decision, Fingerprint, Sample, SplitPlan
 
 
 class AuditStore:
@@ -23,10 +23,14 @@ class AuditStore:
         self.versions_dir = self.root / "versions"
         self.conclusions_dir = self.root / "conclusions"
         self.decisions_dir = self.root / "decisions"
+        self.splits_dir = self.root / "splits"
+        self.comparisons_dir = self.root / "comparisons"
         self.index_path = self.root / "index.json"
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self.conclusions_dir.mkdir(parents=True, exist_ok=True)
         self.decisions_dir.mkdir(parents=True, exist_ok=True)
+        self.splits_dir.mkdir(parents=True, exist_ok=True)
+        self.comparisons_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 数据版本 ----
 
@@ -97,6 +101,38 @@ class AuditStore:
         self.save_version(version_id, all_samples, all_fps, version_metadata)
         return version_metadata
 
+    def remove_version_samples(
+        self,
+        version_id: str,
+        removed_sample_ids: list[str],
+        parent_version_id: str,
+        metadata: dict | None = None,
+    ) -> dict:
+        """删除样本同样靠跨版本复制：生成去掉指定样本的新版本，父版本原样保留。
+
+        不通过改写/删除父版本的原始样本让问题消失；被删样本在父版本中仍可
+        追溯。返回记录谱系与被删样本 id 的版本元信息。
+        """
+
+        parent_samples = self.load_samples(parent_version_id)
+        parent_fps = self.load_fingerprints(parent_version_id)
+        removed = set(removed_sample_ids)
+        existing_ids = {sample.sample_id for sample in parent_samples}
+        missing = removed - existing_ids
+        if missing:
+            raise ValueError(f"要删除的样本在父版本中不存在: {sorted(missing)}")
+        kept_samples = [s for s in parent_samples if s.sample_id not in removed]
+        kept_fps = [f for f in parent_fps if f.sample_id not in removed]
+        version_metadata = {
+            **(metadata or {}),
+            "parent_version_id": parent_version_id,
+            "incremental": True,
+            "removed_sample_ids": sorted(removed),
+            "added_sample_ids": [],
+        }
+        self.save_version(version_id, kept_samples, kept_fps, version_metadata)
+        return version_metadata
+
     def has_version(self, version_id: str) -> bool:
         return self.version_dir(version_id).exists()
 
@@ -140,6 +176,44 @@ class AuditStore:
 
     def list_conclusions(self) -> list[str]:
         return sorted(p.stem for p in self.conclusions_dir.glob("*.json"))
+
+    # ---- 划分版本（不可变；迁移生成新版本，旧版本保留）----
+
+    def _split_path(self, split_version_id: str) -> Path:
+        return self.splits_dir / f"{split_version_id}.json"
+
+    def save_split_plan(self, plan: SplitPlan) -> None:
+        path = self._split_path(plan.split_version_id)
+        if path.exists():
+            raise FileExistsError(
+                f"划分版本已存在: {plan.split_version_id}；"
+                "迁移划分必须使用新的 split_version_id，旧划分不可覆盖"
+            )
+        self._write_json(path, plan.to_dict())
+
+    def has_split_plan(self, split_version_id: str) -> bool:
+        return self._split_path(split_version_id).exists()
+
+    def load_split_plan(self, split_version_id: str) -> SplitPlan:
+        return SplitPlan.from_dict(
+            self._read_json(self._split_path(split_version_id))
+        )
+
+    def list_split_plans(self) -> list[str]:
+        return sorted(p.stem for p in self.splits_dir.glob("*.json"))
+
+    # ---- 划分迁移对比结论（不可覆盖）----
+
+    def save_comparison(self, compare_id: str, report: dict) -> None:
+        path = self.comparisons_dir / f"{compare_id}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"迁移对比已存在: {compare_id}；请使用新的 compare_id"
+            )
+        self._write_json(path, report)
+
+    def load_comparison(self, compare_id: str) -> dict:
+        return self._read_json(self.comparisons_dir / f"{compare_id}.json")
 
     # ---- 人工身份判定（只增不改的事件日志）----
 

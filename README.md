@@ -1,10 +1,13 @@
 # 训练数据审查系统
 
-两轮实现：
+三轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
   修订差异报告。系统只标记并给出人工复核建议，**不会自动删除或修改任何样本**。
+- **第三轮**：同一数据版本上的**多划分版本**（多套 train/val/test 安排）与
+  划分迁移对比；泄漏结论对应各自划分版本，按样本家族查看迁移影响；
+  删除样本同样靠跨版本复制，父版本原样保留。
 
 ## 设计原则
 
@@ -21,6 +24,13 @@
 - **人工判定只增不改、可撤回**：判定是 append-only 事件日志（add/withdraw）；
   每次审查结论内嵌当时的判定快照，撤回并重算后**旧报告仍可追溯、可复现**。
   审查结论本身也不允许覆盖，修订必须使用新的 `audit_id`。
+- **泄漏结论对应各自划分版本**：相似关系（近重复边、分组）与人工身份判定
+  与划分无关、跨划分版本保留；但泄漏结论按各自划分版本计算并记录
+  `split_version_id`，自动基线只在同一划分版本内选取，不能跨划分版本
+  直接沿用。划分版本本身不可变：迁移生成新划分版本，旧划分版本原样保留，
+  恢复旧划分后重算与旧划分版本的完整重算一致。
+- **桥接不整链合并**：新样本同时连接两个家族时，只靠连接存在不会合并全部
+  成员；只有跨组成员构成团才合并，未采纳的桥接边保留为未合并证据。
 
 ## 分组规则（R001）
 
@@ -71,6 +81,36 @@
 
 ## 使用方法
 
+### 划分版本与迁移对比（第三轮）
+
+```bash
+# 1) 为数据版本定义一套划分安排（JSONL：每行 {"sample_id", "split"}）
+python -m data_audit.cli define-split --store ./store --split-version-id sp1 \
+    --version-id v1 --input data/split_base.jsonl
+
+# 2) 迁移到新安排：复制父划分版本并应用变更，旧划分版本原样保留
+python -m data_audit.cli revise-split --store ./store --split-version-id sp2 \
+    --parent-split-version-id sp1 --input data/split_changes.jsonl
+
+# 3) 分别在各划分版本下审查：泄漏结论各自独立（split_version_id 落盘）
+python -m data_audit.cli audit --store ./store --version-id v1 \
+    --audit-id a-sp1 --split-version-id sp1 --no-base
+python -m data_audit.cli audit --store ./store --version-id v1 \
+    --audit-id a-sp2 --split-version-id sp2
+
+# 4) 迁移对比：按样本家族查看影响，区分完全复制 / 局部相似 /
+#    人工确认不同身份三类证据
+python -m data_audit.cli compare --store ./store --version-id v1 \
+    --from-split sp1 --to-split sp2 --compare-id cmp1
+
+# 5) 删除样本：跨版本复制父版本并去掉指定样本，父版本原样保留；
+#    新版本重算与剩余样本一次性导入的完整重算一致
+python -m data_audit.cli remove-samples --store ./store --version-id v3 \
+    --parent-version-id v1 --sample-ids b2
+```
+
+### 基础流程（第一、二轮）
+
 ```bash
 # 1) 导入基线版本并生成指纹
 python -m data_audit.cli ingest --store ./store --version-id v1 --input data/base_incremental.jsonl
@@ -114,6 +154,10 @@ store/
                                # 全部边（含公共段落）、泄漏、排除边、桥接、
                                # 判定快照、相对基线的 changes
   decisions/<version_id>.jsonl # 人工判定事件日志（add / withdraw，只追加）
+  splits/<split_version_id>.json   # 划分版本：sample_id -> split 安排（不可变），
+                                   # 记录父划分版本与应用的变更
+  comparisons/<compare_id>.json    # 划分迁移对比结论（不可覆盖）：
+                                   # 按家族的证据分类与泄漏变化
   index.json
 ```
 
@@ -125,4 +169,6 @@ python -m pytest tests/ -q
 
 覆盖：完全相同/改写/公共段落的误报漏报、链式不传递、人工排除与强制同身份、
 撤回恢复、桥接不合并、跨划分复制新增泄漏、增量与全量一致、原始样本不删除、
-CLI 端到端可追溯。
+CLI 端到端可追溯；多划分版本下泄漏结论各自独立、按家族区分完全复制/局部
+相似/人工确认不同身份、桥接在任意划分下不整链合并、撤回判定/删除样本/
+恢复旧划分后与完整重算一致、划分迁移 CLI 端到端。

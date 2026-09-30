@@ -62,6 +62,37 @@ class Fingerprint:
 
 
 @dataclass(frozen=True)
+class SplitPlan:
+    """一个划分版本：同一数据版本上的一套 train/val/test 安排。
+
+    划分版本与数据版本分开保存、各自不可变：迁移到新的训练/测试安排时
+    生成新的划分版本（可复制父划分版本后应用变更），旧划分版本原样保留，
+    因此任何历史安排的泄漏结论都可追溯、可复现。
+    """
+
+    split_version_id: str
+    version_id: str
+    assignments: dict[str, str]
+    parent_split_version_id: str = ""
+    changes: list[dict[str, Any]] = field(default_factory=list)
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "SplitPlan":
+        return SplitPlan(
+            split_version_id=data["split_version_id"],
+            version_id=data["version_id"],
+            assignments=dict(data["assignments"]),
+            parent_split_version_id=data.get("parent_split_version_id", ""),
+            changes=list(data.get("changes", [])),
+            created_at=data.get("created_at", ""),
+        )
+
+
+@dataclass(frozen=True)
 class AuditRule:
     rule_id: str
     name: str
@@ -92,6 +123,8 @@ class Conclusion:
     base_audit_id: str = ""
     parent_version_id: str = ""
     added_sample_ids: list[str] = field(default_factory=list)
+    # 第三轮：泄漏结论对应各自划分版本，不能跨划分版本直接沿用。
+    split_version_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -118,6 +151,7 @@ class Conclusion:
             base_audit_id=data.get("base_audit_id", ""),
             parent_version_id=data.get("parent_version_id", ""),
             added_sample_ids=list(data.get("added_sample_ids", [])),
+            split_version_id=data.get("split_version_id", ""),
         )
 
 
