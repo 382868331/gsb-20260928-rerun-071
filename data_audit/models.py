@@ -81,6 +81,17 @@ class Conclusion:
     leakages: list[dict[str, Any]] = field(default_factory=list)
     actions: list[dict[str, str]] = field(default_factory=list)
     created_at: str = ""
+    # 第二轮：成组依据、人工排除的相似证据、桥接但未合并的证据、
+    # 应用过的人工判定快照、相对基线审查的修订差异。全部可追溯，
+    # 重算/撤回后旧结论文件仍保留当时的判定快照。
+    group_basis: list[dict[str, Any]] = field(default_factory=list)
+    excluded_edges: list[dict[str, Any]] = field(default_factory=list)
+    bridges: list[dict[str, Any]] = field(default_factory=list)
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    changes: dict[str, Any] = field(default_factory=dict)
+    base_audit_id: str = ""
+    parent_version_id: str = ""
+    added_sample_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -98,5 +109,45 @@ class Conclusion:
             edges=list(data.get("edges", [])),
             leakages=list(data.get("leakages", [])),
             actions=list(data.get("actions", [])),
+            created_at=data.get("created_at", ""),
+            group_basis=list(data.get("group_basis", [])),
+            excluded_edges=list(data.get("excluded_edges", [])),
+            bridges=list(data.get("bridges", [])),
+            decisions=list(data.get("decisions", [])),
+            changes=dict(data.get("changes", {})),
+            base_audit_id=data.get("base_audit_id", ""),
+            parent_version_id=data.get("parent_version_id", ""),
+            added_sample_ids=list(data.get("added_sample_ids", [])),
+        )
+
+
+@dataclass(frozen=True)
+class Decision:
+    """人工身份判定（只增不改的事件日志中的一条有效判定）。
+
+    kind="distinct" 表示人工确认两端是不同身份（排除关系）：相似边保留为
+    证据，但不参与成组、不计为泄漏；
+    kind="duplicate" 表示人工确认两端同身份：强制并为一个身份，并在成组
+    依据中标注来源是人工而非自动相似度。
+    """
+
+    decision_id: str
+    sample_a: str
+    sample_b: str
+    kind: str
+    note: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "Decision":
+        return Decision(
+            decision_id=data["decision_id"],
+            sample_a=data["sample_a"],
+            sample_b=data["sample_b"],
+            kind=data["kind"],
+            note=data.get("note", ""),
             created_at=data.get("created_at", ""),
         )

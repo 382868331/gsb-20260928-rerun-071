@@ -89,13 +89,86 @@ def test_actions_never_delete(audited):
 def test_complete_link_rejects_chain_collapse():
     # 合成 A~B、B~C 但 A 不~C 的链式结构：必须分成两个身份而不是 {A,B,C}。
     edges = [("a", "b", 0.9), ("b", "c", 0.6)]
-    groups = complete_link_groups(["a", "b", "c"], edges)
+    groups, _ = complete_link_groups(["a", "b", "c"], edges)
     assert groups == [["a", "b"]]
 
 
 def test_triangle_clique_groups_all_three():
     edges = [("a", "b", 0.9), ("b", "c", 0.8), ("a", "c", 0.7)]
-    assert complete_link_groups(["a", "b", "c"], edges) == [["a", "b", "c"]]
+    groups, basis = complete_link_groups(["a", "b", "c"], edges)
+    assert groups == [["a", "b", "c"]]
+    assert {record["source"] for record in basis} == {"similarity"}
+
+
+def test_human_excluded_pair_does_not_group_but_edge_kept(audited):
+    # 人工确认 c2/c3 为不同身份：边仍在，但不成组、不计泄漏。
+    from data_audit.models import Decision
+    from data_audit.rules import run_near_duplicate_rule
+
+    samples, shingle_sets, _ = audited
+    decision = Decision(
+        decision_id="h1", sample_a="c2", sample_b="c3", kind="distinct"
+    )
+    conclusion = run_near_duplicate_rule(
+        samples, shingle_sets, audit_id="a-excl", version_id="v-test",
+        decisions=[decision],
+    )
+    assert not any(
+        {"c2", "c3"} <= set(group) for group in conclusion.groups
+    )
+    assert not any(
+        ("c2", "c3") == (e["sample_a"], e["sample_b"])
+        for e in conclusion.leakages
+    )
+    excluded = conclusion.excluded_edges
+    assert len(excluded) == 1
+    assert (excluded[0]["sample_a"], excluded[0]["sample_b"]) == ("c2", "c3")
+    assert excluded[0]["raw_leakage"] is True
+    assert excluded[0]["status"] == "human_excluded"
+    # 相似证据和局部公共段落保留。
+    assert excluded[0]["common_passage"]
+
+
+def test_human_decision_withdraw_restores_grouping(audited):
+    # 撤回人工判定后重算：泄漏证据恢复；旧结论文件仍存在。
+    from data_audit.models import Decision
+    from data_audit.rules import run_near_duplicate_rule
+    from data_audit.storage import AuditStore
+
+    samples, shingle_sets, original = audited
+    excluded = run_near_duplicate_rule(
+        samples, shingle_sets, audit_id="a-excl2", version_id="v-test",
+        decisions=[Decision("h", "c2", "c3", "distinct")],
+    )
+    assert len(excluded.leakages) == len(original.leakages) - 1
+
+    # 模拟撤回：不再传任何有效判定，结果应与原始一致。
+    restored = run_near_duplicate_rule(
+        samples, shingle_sets, audit_id="a-restored", version_id="v-test"
+    )
+    assert restored.groups == original.groups
+    assert len(restored.leakages) == len(original.leakages)
+
+
+def test_human_confirmed_duplicate_forces_identity_even_below_threshold(audited):
+    # t3/v2 自动规则下仅有公共段落、不成组；人工确认同身份后必须强制成团，
+    # 且跨划分构成泄漏；边标记为人工强制，相似度按 0 记录，不伪造相似度。
+    from data_audit.models import Decision
+    from data_audit.rules import run_near_duplicate_rule
+
+    samples, shingle_sets, _ = audited
+    conclusion = run_near_duplicate_rule(
+        samples, shingle_sets, audit_id="a-dup", version_id="v-test",
+        decisions=[Decision("h", "t3", "v2", "duplicate")],
+    )
+    assert any({"t3", "v2"} <= set(group) for group in conclusion.groups)
+    edge = next(
+        e for e in conclusion.edges
+        if {e["sample_a"], e["sample_b"]} == {"t3", "v2"}
+    )
+    assert edge["human_forced"] is True
+    assert edge["status"] == "within_group"
+    assert edge["leakage"] is True
 
 
 def test_stores_are_separate_and_traceable(tmp_path):

@@ -1,0 +1,5 @@
+{"sample_id": "a1", "split": "train", "text": "乙戊戊乙丙戊丁戊"}
+{"sample_id": "a2", "split": "train", "text": "乙丙戊丁戊乙戊戊"}
+{"sample_id": "a3", "split": "train", "text": "乙丙戊乙戊丁戊戊"}
+{"sample_id": "b1", "split": "train", "text": "子子卯寅丑丑卯卯"}
+{"sample_id": "b2", "split": "val", "text": "子子卯卯寅丑丑卯"}
