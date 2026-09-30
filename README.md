@@ -1,10 +1,15 @@
 # 训练数据审查系统
 
-两轮实现：
+三轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
   修订差异报告。系统只标记并给出人工复核建议，**不会自动删除或修改任何样本**。
+- **第三轮**：同一数据版本上的多个**划分版本**（训练/测试安排）：相似关系与
+  人工身份判定跨划分版本保留，泄漏结论按各自划分版本重算、不跨版本沿用；
+  按样本家族查看迁移影响（区分完全复制 / 局部相似 / 人工确认不同身份）；
+  支持跨版本复制式删除样本。撤回判定、删除样本、恢复旧划分后的增量结果
+  与该版本完整重算一致。
 
 ## 设计原则
 
@@ -21,6 +26,27 @@
 - **人工判定只增不改、可撤回**：判定是 append-only 事件日志（add/withdraw）；
   每次审查结论内嵌当时的判定快照，撤回并重算后**旧报告仍可追溯、可复现**。
   审查结论本身也不允许覆盖，修订必须使用新的 `audit_id`。
+- **泄漏结论对应各自划分版本**：划分版本（`splits/<split_id>.json`）只重新
+  安排样本的 train/val/test 归属，不可覆盖；相似边、分组与人工判定与划分
+  无关、继续保留，泄漏证据在每个划分版本下独立重算。自动基线按
+  （数据版本, 划分版本）匹配，不会把另一种划分的结论当作基线沿用。
+  恢复旧划分 = 再次引用旧的 `split_id` 重算。
+- **删除也是跨版本复制**：`remove-samples` 复制父版本并剔除指定样本生成
+  新版本，父版本原样保留；两端样本都存活的人工判定事件复制到新版本日志，
+  引用被删样本的判定随样本一起不再生效。
+
+## 划分迁移与家族视图
+
+`audit --split-id` 按指定划分版本重算泄漏；与基线审查（可为另一种划分）
+对比时，`changes.families` 给出**按样本家族（近重复组）的迁移影响**：
+
+- 每个家族列出触及它的全部相似证据，分类为 `exact_copy`（完全复制，
+  规范化哈希一致）/ `partial_similarity`（局部相似）/
+  `human_distinct`（人工确认不同身份）/ `human_confirmed`（人工确认同身份）；
+- 每条证据标注两个划分版本下的划分归属（`split_before` / `split_after`）
+  与泄漏结论变化（`leakage_before` / `leakage_after`）；
+- 跨家族的局部相似边与人工排除边也列入触及家族的证据
+  （`within_family=false`），桥接样本仍只在跨组构成团时才合并。
 
 ## 分组规则（R001）
 
@@ -98,7 +124,18 @@ python -m data_audit.cli withdraw --store ./store --version-id v2 \
 python -m data_audit.cli audit --store ./store --version-id v2 --audit-id a3 \
     --base-audit-id a2
 
-# 7) 随时查看任意历史审查报告
+# 7) 第三轮：保存另一种训练/测试安排（划分版本），比较迁移影响
+echo '{"sample_id": "d1", "split": "train"}' > /tmp/splits.jsonl
+python -m data_audit.cli split-assign --store ./store --version-id v2 \
+    --split-id sp1 --input /tmp/splits.jsonl
+python -m data_audit.cli audit --store ./store --version-id v2 --audit-id a4 \
+    --split-id sp1 --base-audit-id a3 --report   # 含按样本家族的迁移影响
+
+# 8) 删除样本（跨版本复制，父版本保留；存活的人工判定随之保留）
+python -m data_audit.cli remove-samples --store ./store --version-id v3 \
+    --parent-version-id v2 --sample-ids d1
+
+# 9) 随时查看任意历史审查报告
 python -m data_audit.cli report --store ./store --audit-id a1
 ```
 
@@ -113,6 +150,7 @@ store/
   conclusions/<audit_id>.json  # 审查结论（不可覆盖）：分组、成组依据、
                                # 全部边（含公共段落）、泄漏、排除边、桥接、
                                # 判定快照、相对基线的 changes
+  splits/<split_id>.json       # 划分版本（不可覆盖）：样本划分的重新安排
   decisions/<version_id>.jsonl # 人工判定事件日志（add / withdraw，只追加）
   index.json
 ```
@@ -125,4 +163,7 @@ python -m pytest tests/ -q
 
 覆盖：完全相同/改写/公共段落的误报漏报、链式不传递、人工排除与强制同身份、
 撤回恢复、桥接不合并、跨划分复制新增泄漏、增量与全量一致、原始样本不删除、
-CLI 端到端可追溯。
+CLI 端到端可追溯；第三轮补充：划分迁移重算泄漏且分组保留、家族视图区分
+完全复制/局部相似/人工确认不同身份、桥接在划分迁移下仍不合并、
+删除样本与恢复旧划分后的增量结果与完整重算一致、
+自动基线不跨划分版本沿用。

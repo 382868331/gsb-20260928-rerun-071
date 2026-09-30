@@ -28,6 +28,11 @@ def render_markdown(conclusion: Conclusion, sample_text: dict[str, str]) -> str:
     lines.append(f"# 审查报告 {conclusion.audit_id}")
     lines.append("")
     lines.append(f"- 数据版本：`{conclusion.version_id}`")
+    if conclusion.split_id:
+        lines.append(
+            f"- 划分版本：`{conclusion.split_id}`"
+            "（泄漏结论按此划分重算，不跨划分版本沿用）"
+        )
     if conclusion.parent_version_id:
         lines.append(
             f"- 增量版本：父版本 `{conclusion.parent_version_id}`，"
@@ -108,6 +113,53 @@ def render_markdown(conclusion: Conclusion, sample_text: dict[str, str]) -> str:
             "- 撤销/不再成立的泄漏证据："
             + (", ".join(map(str, changes.get("leakages_removed", []))) or "无")
         )
+        if changes.get("split_id_before") is not None and (
+            changes.get("split_id_before") != changes.get("split_id_after")
+        ):
+            lines.append(
+                "- 划分版本迁移："
+                f"`{changes.get('split_id_before') or '原始划分'}` -> "
+                f"`{changes.get('split_id_after') or '原始划分'}`"
+            )
+        families = changes.get("families", [])
+        if families:
+            kind_name = {
+                "exact_copy": "完全复制",
+                "partial_similarity": "局部相似",
+                "human_distinct": "人工确认不同身份",
+                "human_confirmed": "人工确认同身份",
+            }
+            lines.append("")
+            lines.append("### 按样本家族的迁移影响")
+            lines.append("")
+            for family in families:
+                added = family.get("leakages_added", [])
+                removed = family.get("leakages_removed", [])
+                lines.append(
+                    f"- 家族 {family['family']}："
+                    f"新增泄漏 {len(added)} 条，撤销泄漏 {len(removed)} 条"
+                )
+                for item in family.get("evidence", []):
+                    before = (
+                        "/".join(item["split_before"])
+                        if item.get("split_before")
+                        else "无"
+                    )
+                    after = "/".join(item["split_after"])
+                    leak_change = ""
+                    if item["leakage_before"] != item["leakage_after"]:
+                        leak_change = (
+                            "，泄漏：是 -> 否"
+                            if item["leakage_before"]
+                            else "，泄漏：否 -> 是"
+                        )
+                    scope = "" if item["within_family"] else "（跨家族证据）"
+                    lines.append(
+                        f"    - {item['pair']} "
+                        f"{kind_name.get(item['kind'], item['kind'])}{scope} "
+                        f"sim={item['similarity']:.3f} "
+                        f"划分 {before} -> {after}{leak_change}"
+                    )
         lines.append("")
 
     lines.append("## 近重复分组（身份判定）")

@@ -1,11 +1,14 @@
 """命令行入口：
 
-``ingest``       导入数据版本并生成指纹（完整版本，原始样本不可变）；
-``add-samples``  跨版本复制父版本全部样本并追加新样本，生成增量版本；
-``audit``        对已保存版本运行 R001 近重复/泄漏规则，可带基线与人工判定；
-``decide``       记录人工身份判定（distinct 不同身份 / duplicate 同身份）；
-``withdraw``     撤回一条人工判定（事件日志只追加，旧报告仍可追溯）；
-``report``       渲染 Markdown 报告（含修订差异、桥接与排除证据）。
+``ingest``        导入数据版本并生成指纹（完整版本，原始样本不可变）；
+``add-samples``   跨版本复制父版本全部样本并追加新样本，生成增量版本；
+``remove-samples`` 跨版本复制父版本并剔除指定样本，生成删除版本；
+``split-assign``  为数据版本保存一个新的划分版本（训练/测试安排）；
+``audit``         对已保存版本运行 R001 近重复/泄漏规则，可指定划分版本、
+                  基线与人工判定；
+``decide``        记录人工身份判定（distinct 不同身份 / duplicate 同身份）；
+``withdraw``      撤回一条人工判定（事件日志只追加，旧报告仍可追溯）；
+``report``        渲染 Markdown 报告（含修订差异、家族迁移、桥接与排除证据）。
 """
 
 from __future__ import annotations
@@ -55,16 +58,71 @@ def cmd_add_samples(args: argparse.Namespace) -> None:
     print("新增样本：" + ", ".join(metadata["added_sample_ids"]))
 
 
+def cmd_remove_samples(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    metadata = store.remove_version(
+        version_id=args.version_id,
+        parent_version_id=args.parent_version_id,
+        remove_sample_ids=list(args.sample_ids),
+    )
+    total = len(store.load_samples(args.version_id))
+    print(
+        f"已保存删除版本 {args.version_id}（父版本 {args.parent_version_id}）："
+        f"剔除 {len(metadata['removed_sample_ids'])} 个样本，"
+        f"版本内剩 {total} 个；父版本原样保留"
+    )
+    print("剔除样本：" + ", ".join(metadata["removed_sample_ids"]))
+
+
+def cmd_split_assign(args: argparse.Namespace) -> None:
+    import json
+    from pathlib import Path
+
+    store = AuditStore(args.store)
+    if not store.has_version(args.version_id):
+        raise SystemExit(f"版本不存在: {args.version_id}")
+    assignments: dict[str, str] = {}
+    with Path(args.input).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            sample_id = str(row["sample_id"])
+            if sample_id in assignments:
+                raise SystemExit(
+                    f"划分清单中重复的 sample_id: {sample_id} (第 {line_number} 行)"
+                )
+            assignments[sample_id] = str(row["split"])
+    store.save_split(
+        split_id=args.split_id,
+        version_id=args.version_id,
+        assignments=assignments,
+        parent_split_id=args.parent_split_id,
+        note=args.note,
+        created_at=utc_now(),
+    )
+    print(
+        f"已保存划分版本 {args.split_id}（数据版本 {args.version_id}）："
+        f"重新安排 {len(assignments)} 个样本的划分；"
+        "相似关系与人工判定保留，泄漏结论按此划分重算"
+    )
+
+
 def _resolve_base_conclusion(
-    store: AuditStore, version_id: str, base_audit_id: str | None
+    store: AuditStore, version_id: str, base_audit_id: str | None,
+    split_id: str = "",
 ):
     if base_audit_id:
         return store.load_conclusion(base_audit_id)
-    # 未显式给基线时，自动选择同一数据版本上最近一次审查作为基线。
+    # 未显式给基线时，自动选择同一数据版本、同一划分版本上最近一次
+    # 审查作为基线：泄漏结论对应各自划分，不跨划分版本直接沿用。
     candidates = []
     for audit_id in store.list_conclusions():
         conclusion = store.load_conclusion(audit_id)
-        if conclusion.version_id == version_id:
+        if (
+            conclusion.version_id == version_id
+            and conclusion.split_id == split_id
+        ):
             candidates.append((conclusion.created_at, audit_id, conclusion))
     if not candidates:
         return None
@@ -79,6 +137,19 @@ def cmd_audit(args: argparse.Namespace) -> None:
     shingle_sets = {fp.sample_id: set(fp.shingles) for fp in fingerprints}
     decisions = store.load_active_decisions(args.version_id)
 
+    split_id = args.split_id or ""
+    split_overrides: dict[str, str] = {}
+    if split_id:
+        if not store.has_split(split_id):
+            raise SystemExit(f"划分版本不存在: {split_id}")
+        split_record = store.load_split(split_id)
+        if split_record["version_id"] != args.version_id:
+            raise SystemExit(
+                f"划分版本 {split_id} 属于数据版本 "
+                f"{split_record['version_id']}，不能用于 {args.version_id}"
+            )
+        split_overrides = dict(split_record["assignments"])
+
     parent_version_id = ""
     added_sample_ids: list[str] = []
     version_meta_path = store.version_dir(args.version_id) / "version.json"
@@ -92,7 +163,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
     base_conclusion = None
     if args.base_audit_id or not args.no_base:
         base_conclusion = _resolve_base_conclusion(
-            store, args.version_id, args.base_audit_id
+            store, args.version_id, args.base_audit_id, split_id=split_id
         )
 
     conclusion = run_near_duplicate_rule(
@@ -106,10 +177,17 @@ def cmd_audit(args: argparse.Namespace) -> None:
         base_conclusion=base_conclusion,
         parent_version_id=parent_version_id,
         added_sample_ids=added_sample_ids,
+        split_id=split_id,
+        split_overrides=split_overrides,
+        normalized_hashes={
+            fp.sample_id: fp.normalized_hash for fp in fingerprints
+        },
     )
     store.save_conclusion(conclusion)
+    split_note = f"，划分版本 {split_id}" if split_id else ""
     print(
-        f"审查 {args.audit_id} 完成：{len(conclusion.groups)} 个近重复组，"
+        f"审查 {args.audit_id} 完成{split_note}："
+        f"{len(conclusion.groups)} 个近重复组，"
         f"{len(conclusion.leakages)} 条跨划分泄漏证据，"
         f"{len(conclusion.excluded_edges)} 条人工排除的相似边，"
         f"{len(conclusion.bridges)} 条桥接未合并证据（未删除任何样本）"
@@ -196,10 +274,39 @@ def build_parser() -> argparse.ArgumentParser:
     add_samples.add_argument("--input", required=True, help="仅含新增样本的 JSONL")
     add_samples.set_defaults(func=cmd_add_samples)
 
+    remove_samples = sub.add_parser(
+        "remove-samples", help="复制父版本并剔除指定样本，生成删除版本"
+    )
+    remove_samples.add_argument("--store", required=True)
+    remove_samples.add_argument("--version-id", required=True, help="新版本 id")
+    remove_samples.add_argument("--parent-version-id", required=True)
+    remove_samples.add_argument(
+        "--sample-ids", required=True, nargs="+", help="要剔除的样本 id"
+    )
+    remove_samples.set_defaults(func=cmd_remove_samples)
+
+    split_assign = sub.add_parser(
+        "split-assign", help="为数据版本保存新的划分版本（训练/测试安排）"
+    )
+    split_assign.add_argument("--store", required=True)
+    split_assign.add_argument("--version-id", required=True)
+    split_assign.add_argument("--split-id", required=True)
+    split_assign.add_argument(
+        "--input", required=True,
+        help="JSONL 划分清单，每行 {sample_id, split}；未列出的样本保持原划分",
+    )
+    split_assign.add_argument("--parent-split-id", default="")
+    split_assign.add_argument("--note", default="")
+    split_assign.set_defaults(func=cmd_split_assign)
+
     audit = sub.add_parser("audit", help="运行近重复与划分泄漏检查")
     audit.add_argument("--store", required=True)
     audit.add_argument("--version-id", required=True)
     audit.add_argument("--audit-id", required=True)
+    audit.add_argument(
+        "--split-id", default="",
+        help="按指定划分版本重算泄漏（默认使用样本原始划分）",
+    )
     audit.add_argument("--threshold", type=float, default=0.45)
     audit.add_argument(
         "--base-audit-id", default="", help="修订对比的基线审查 id（默认自动取最近一次）"

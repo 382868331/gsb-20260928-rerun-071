@@ -1,4 +1,4 @@
-"""分层存储：数据版本、样本指纹、审查结论分别保存，互不覆盖。
+"""分层存储：数据版本、样本指纹、审查结论、划分版本分别保存，互不覆盖。
 
 目录结构::
 
@@ -6,6 +6,9 @@
       versions/<version_id>/samples.jsonl       # 原始样本（数据版本）
       versions/<version_id>/fingerprints.jsonl  # 样本指纹
       conclusions/<audit_id>.json               # 审查结论
+      splits/<split_id>.json                    # 划分版本（同一批样本的另一种
+                                                # 训练/测试安排，不可覆盖）
+      decisions/<version_id>.jsonl              # 人工判定事件日志（只追加）
       index.json                                # 版本与审查记录索引
 """
 
@@ -23,10 +26,12 @@ class AuditStore:
         self.versions_dir = self.root / "versions"
         self.conclusions_dir = self.root / "conclusions"
         self.decisions_dir = self.root / "decisions"
+        self.splits_dir = self.root / "splits"
         self.index_path = self.root / "index.json"
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self.conclusions_dir.mkdir(parents=True, exist_ok=True)
         self.decisions_dir.mkdir(parents=True, exist_ok=True)
+        self.splits_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 数据版本 ----
 
@@ -96,6 +101,106 @@ class AuditStore:
         }
         self.save_version(version_id, all_samples, all_fps, version_metadata)
         return version_metadata
+
+    def remove_version(
+        self,
+        version_id: str,
+        parent_version_id: str,
+        remove_sample_ids: list[str],
+        metadata: dict | None = None,
+    ) -> dict:
+        """删除样本生成新版本：复制父版本后剔除指定样本，父版本原样保留。
+
+        与追加一样，删除也是“跨版本复制”而非就地修改：旧版本与旧审查
+        结论全部可追溯。两端样本都存活的人工判定事件会复制到新版本的
+        事件日志中（只追加，不改写父版本日志），引用被删样本的判定随
+        样本一起不再生效。
+        """
+
+        parent_samples = self.load_samples(parent_version_id)
+        parent_fps = self.load_fingerprints(parent_version_id)
+        existing_ids = {sample.sample_id for sample in parent_samples}
+        remove_ids = set(remove_sample_ids)
+        missing = remove_ids - existing_ids
+        if missing:
+            raise ValueError(f"要删除的样本不存在于父版本: {sorted(missing)}")
+
+        kept_samples = [
+            sample for sample in parent_samples
+            if sample.sample_id not in remove_ids
+        ]
+        kept_fps = [
+            fp for fp in parent_fps if fp.sample_id not in remove_ids
+        ]
+        version_metadata = {
+            **(metadata or {}),
+            "parent_version_id": parent_version_id,
+            "incremental": True,
+            "removed_sample_ids": sorted(remove_ids),
+        }
+        self.save_version(version_id, kept_samples, kept_fps, version_metadata)
+
+        surviving_ids = existing_ids - remove_ids
+        for event in self.load_decision_events(parent_version_id):
+            if event["event"] == "add":
+                pair = {
+                    event["decision"]["sample_a"],
+                    event["decision"]["sample_b"],
+                }
+            else:
+                pair = {event["sample_a"], event["sample_b"]}
+            if pair <= surviving_ids:
+                self.append_decision_event(version_id, event)
+        return version_metadata
+
+    # ---- 划分版本（同一数据版本的不同训练/测试安排）----
+
+    def save_split(
+        self,
+        split_id: str,
+        version_id: str,
+        assignments: dict[str, str],
+        parent_split_id: str = "",
+        note: str = "",
+        created_at: str = "",
+    ) -> dict:
+        """保存一个划分版本：对指定数据版本的样本重新安排划分。
+
+        划分版本不可覆盖；恢复旧划分就是再次引用旧的 split_id 重算。
+        未出现在 assignments 中的样本保持数据版本里的原始划分。
+        """
+
+        path = self.splits_dir / f"{split_id}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"划分版本已存在: {split_id}；新的划分安排必须使用新的 split_id"
+            )
+        sample_ids = {s.sample_id for s in self.load_samples(version_id)}
+        unknown = set(assignments) - sample_ids
+        if unknown:
+            raise ValueError(f"划分版本引用了不存在的样本: {sorted(unknown)}")
+        record = {
+            "split_id": split_id,
+            "version_id": version_id,
+            "assignments": dict(sorted(assignments.items())),
+            "parent_split_id": parent_split_id,
+            "note": note,
+            "created_at": created_at,
+        }
+        self._write_json(path, record)
+        index = self._load_index()
+        index.setdefault("splits", {})[split_id] = {
+            "version_id": version_id,
+            "assignment_count": len(assignments),
+        }
+        self._write_index(index)
+        return record
+
+    def load_split(self, split_id: str) -> dict:
+        return self._read_json(self.splits_dir / f"{split_id}.json")
+
+    def has_split(self, split_id: str) -> bool:
+        return (self.splits_dir / f"{split_id}.json").exists()
 
     def has_version(self, version_id: str) -> bool:
         return self.version_dir(version_id).exists()

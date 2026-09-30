@@ -175,15 +175,32 @@ def run_near_duplicate_rule(
     base_conclusion: Conclusion | None = None,
     parent_version_id: str = "",
     added_sample_ids: list[str] | None = None,
+    split_id: str = "",
+    split_overrides: dict[str, str] | None = None,
+    normalized_hashes: dict[str, str] | None = None,
 ) -> Conclusion:
-    """执行 R001：近重复分组、跨划分泄漏证据、人工判定与修订差异。"""
+    """执行 R001：近重复分组、跨划分泄漏证据、人工判定与修订差异。
+
+    split_overrides 是划分版本对样本划分的重新安排：相似关系与人工
+    身份判定与划分无关、继续保留，只有泄漏结论按该划分版本重算，
+    不跨划分版本直接沿用。
+    """
 
     decisions = decisions or []
     added_sample_ids = added_sample_ids or []
     sample_ids = sorted(sample.sample_id for sample in samples)
     sample_ids_set = set(sample_ids)
     split_of = {sample.sample_id: sample.split for sample in samples}
+    split_overrides = split_overrides or {}
+    unknown_overrides = set(split_overrides) - sample_ids_set
+    if unknown_overrides:
+        raise ValueError(
+            f"划分版本引用了不存在的样本: {sorted(unknown_overrides)}"
+        )
+    for sample_id, split in split_overrides.items():
+        split_of[sample_id] = split
     text_of = {sample.sample_id: sample.text for sample in samples}
+    normalized_hashes = normalized_hashes or {}
 
     excluded_pairs: set[tuple[str, str]] = set()
     forced_pairs: set[tuple[str, str]] = set()
@@ -232,6 +249,11 @@ def run_near_duplicate_rule(
             "split_a": split_of[left_id],
             "split_b": split_of[right_id],
             "similarity": round(similarity, 6),
+            "exact_copy": (
+                normalized_hashes.get(left_id) is not None
+                and normalized_hashes.get(left_id)
+                == normalized_hashes.get(right_id)
+            ),
             "cross_split": split_of[left_id] != split_of[right_id],
             "raw_leakage": _is_leakage(split_of[left_id], split_of[right_id]),
             "status": status,
@@ -257,7 +279,9 @@ def run_near_duplicate_rule(
     base_audit_id = ""
     if base_conclusion is not None:
         base_audit_id = base_conclusion.audit_id
-        changes = diff_conclusions(base_conclusion, edge_records, groups, leakages)
+        changes = diff_conclusions(
+            base_conclusion, edge_records, groups, leakages, split_id=split_id
+        )
 
     return Conclusion(
         audit_id=audit_id,
@@ -277,6 +301,7 @@ def run_near_duplicate_rule(
         base_audit_id=base_audit_id,
         parent_version_id=parent_version_id,
         added_sample_ids=sorted(added_sample_ids),
+        split_id=split_id,
     )
 
 
@@ -285,8 +310,14 @@ def diff_conclusions(
     new_edges: list[dict],
     new_groups: list[list[str]],
     new_leakages: list[dict],
+    split_id: str = "",
 ) -> dict:
-    """对比基线审查与新审查，指出分组与泄漏证据发生了哪些变化。"""
+    """对比基线审查与新审查，指出分组与泄漏证据发生了哪些变化。
+
+    同一数据版本、不同划分版本之间对比时，额外给出按样本家族（近重复
+    组）的迁移影响：每个家族内的证据按完全复制 / 局部相似 / 人工确认
+    不同身份分类，并标注该证据在两个划分版本下是否构成泄漏。
+    """
 
     base_groups = [set(group) for group in base.groups]
     new_groups_set = [set(group) for group in new_groups]
@@ -361,7 +392,7 @@ def diff_conclusions(
         list(pair) for pair in sorted(base_pairs - new_pairs)
     ]
 
-    return {
+    changes = {
         "groups_added": sorted(groups_added),
         "groups_removed": sorted(groups_removed),
         "groups_unchanged": sorted(groups_unchanged),
@@ -374,6 +405,110 @@ def diff_conclusions(
         "leakage_count_before": len(base.leakages),
         "leakage_count_after": len(new_leakages),
     }
+    if base.version_id and base.split_id != split_id:
+        changes["split_id_before"] = base.split_id
+        changes["split_id_after"] = split_id
+    if base.version_id:
+        changes["families"] = family_migration(
+            base, new_groups_set, new_edges, new_leakages
+        )
+    return changes
+
+
+def _evidence_kind(record: dict) -> str:
+    """把一条相似证据分类为：完全复制 / 局部相似 / 人工确认不同身份。"""
+
+    if record["status"] == "human_excluded":
+        return "human_distinct"
+    if record.get("human_forced"):
+        return "human_confirmed"
+    if record.get("exact_copy"):
+        return "exact_copy"
+    if "exact_copy" not in record and record["similarity"] >= 1.0 - 1e-9:
+        # 兼容没有规范化哈希信息的旧记录：退化为相似度判断。
+        return "exact_copy"
+    return "partial_similarity"
+
+
+def family_migration(
+    base: Conclusion,
+    new_groups: list[set[str]],
+    new_edges: list[dict],
+    new_leakages: list[dict],
+) -> list[dict]:
+    """按样本家族查看迁移影响。
+
+    家族即新审查的近重复组（身份判定）。相似关系与人工判定跨划分版本
+    保留，因此同一批样本的家族结构可直接对比；每个家族列出触及它的
+    全部相似证据（含跨家族的局部相似与人工排除边），标注证据类型、
+    两个划分版本下的划分归属，以及泄漏结论的变化。
+    """
+
+    base_edge_by_pair = {
+        tuple(sorted((record["sample_a"], record["sample_b"]))): record
+        for record in base.edges
+    }
+    base_leak_pairs = {
+        tuple(sorted((record["sample_a"], record["sample_b"])))
+        for record in base.leakages
+    }
+    new_leak_pairs = {
+        tuple(sorted((record["sample_a"], record["sample_b"])))
+        for record in new_leakages
+    }
+
+    families: list[dict] = []
+    sorted_groups = sorted(
+        (sorted(group) for group in new_groups), key=lambda g: (g[0], len(g))
+    )
+    for group in sorted_groups:
+        members = set(group)
+        evidence: list[dict] = []
+        for record in new_edges:
+            pair = tuple(sorted((record["sample_a"], record["sample_b"])))
+            if not ({record["sample_a"], record["sample_b"]} & members):
+                continue
+            base_edge = base_edge_by_pair.get(pair)
+            evidence.append(
+                {
+                    "pair": list(pair),
+                    "kind": _evidence_kind(record),
+                    "similarity": record["similarity"],
+                    "within_family": {record["sample_a"], record["sample_b"]}
+                    <= members,
+                    "split_before": (
+                        [base_edge["split_a"], base_edge["split_b"]]
+                        if base_edge is not None
+                        else None
+                    ),
+                    "split_after": [record["split_a"], record["split_b"]],
+                    "leakage_before": pair in base_leak_pairs,
+                    "leakage_after": pair in new_leak_pairs,
+                }
+            )
+        evidence.sort(key=lambda item: item["pair"])
+        touching = [
+            pair
+            for pair in base_leak_pairs | new_leak_pairs
+            if set(pair) & members
+        ]
+        families.append(
+            {
+                "family": group,
+                "evidence": evidence,
+                "leakages_added": [
+                    list(pair)
+                    for pair in sorted(touching)
+                    if pair in new_leak_pairs and pair not in base_leak_pairs
+                ],
+                "leakages_removed": [
+                    list(pair)
+                    for pair in sorted(touching)
+                    if pair in base_leak_pairs and pair not in new_leak_pairs
+                ],
+            }
+        )
+    return families
 
 
 def _build_actions(samples, groups, leakages, excluded_edges) -> list[dict[str, str]]:

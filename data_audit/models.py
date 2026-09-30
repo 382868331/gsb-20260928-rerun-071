@@ -92,6 +92,9 @@ class Conclusion:
     base_audit_id: str = ""
     parent_version_id: str = ""
     added_sample_ids: list[str] = field(default_factory=list)
+    # 第三轮：划分版本。相似关系与人工身份判定跨划分版本保留，但泄漏
+    # 结论按各自划分版本落盘，不跨划分版本直接沿用。
+    split_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -118,6 +121,7 @@ class Conclusion:
             base_audit_id=data.get("base_audit_id", ""),
             parent_version_id=data.get("parent_version_id", ""),
             added_sample_ids=list(data.get("added_sample_ids", [])),
+            split_id=data.get("split_id", ""),
         )
 
 
