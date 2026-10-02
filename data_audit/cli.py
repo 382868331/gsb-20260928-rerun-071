@@ -255,6 +255,312 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(render_markdown(conclusion, sample_text))
 
 
+
+# ---- 第四轮：候选划分方案 ----
+
+
+def _plan_context(store, version_id, split_id, threshold):
+    """重算（不落盘）当前划分下的审查结论，供方案检查/建议复用。"""
+
+    samples = store.load_samples(version_id)
+    fingerprints = store.load_fingerprints(version_id)
+    shingle_sets = {fp.sample_id: set(fp.shingles) for fp in fingerprints}
+    decisions = store.load_active_decisions(version_id)
+    split_overrides = {}
+    if split_id:
+        if not store.has_split(split_id):
+            raise SystemExit(f"划分版本不存在: {split_id}")
+        record = store.load_split(split_id)
+        if record["version_id"] != version_id:
+            raise SystemExit(
+                f"划分版本 {split_id} 属于数据版本 "
+                f"{record['version_id']}，不能用于 {version_id}"
+            )
+        split_overrides = dict(record["assignments"])
+    conclusion = run_near_duplicate_rule(
+        samples=samples,
+        shingle_sets=shingle_sets,
+        audit_id="(planning)",
+        version_id=version_id,
+        threshold=threshold,
+        decisions=decisions,
+        split_id=split_id,
+        split_overrides=split_overrides,
+        normalized_hashes={
+            fp.sample_id: fp.normalized_hash for fp in fingerprints
+        },
+    )
+    split_of = {sample.sample_id: sample.split for sample in samples}
+    for sample_id, split in split_overrides.items():
+        split_of[sample_id] = split
+    return samples, split_of, conclusion, decisions
+
+
+def _distinct_pairs(decisions):
+    return {
+        tuple(sorted((d.sample_a, d.sample_b)))
+        for d in decisions
+        if d.kind == "distinct"
+    }
+
+
+def _print_violations(violations):
+    if not violations:
+        print("  （无约束违反）")
+    for item in violations:
+        print(f"  [{item['kind']}] {item['detail']}")
+        if item["kind"] == "family_split":
+            for sid, split in sorted(item["splits"].items()):
+                print(f"    {sid} -> {split}")
+        if item["kind"] == "source_overlap":
+            for key, ids in sorted(item["samples"].items()):
+                print(f"    {key}: {', '.join(ids)}")
+
+
+def _print_conflicts(conflicts):
+    if not conflicts:
+        print("  （无未决冲突）")
+    for item in conflicts:
+        print(f"  [{item['kind']}] {item['detail']}")
+
+
+def _print_move(move):
+    print(
+        f"  {move['id']}: 移动 {move['unit']}（{move['unit_kind']}）"
+        f" -> {move['to']}"
+    )
+    resolved = move["improves"]["leakages_resolved"]
+    print(f"    改善：消除泄漏 {resolved if resolved else '无'}")
+    added = move["breaks"]["leakages_added"]
+    violations = move["breaks"]["violations_added"]
+    print(f"    代价：新增泄漏 {added if added else '无'}")
+    if violations:
+        for item in violations:
+            print(f"    破坏约束 [{item['kind']}] {item['detail']}")
+    else:
+        print("    不破坏任何数量或来源限制")
+
+
+def cmd_plan_check(args):
+    from .planning import (
+        bound_units,
+        evaluate_constraints,
+        find_conflicts,
+        load_constraints,
+    )
+
+    store = AuditStore(args.store)
+    constraints = load_constraints(args.constraints)
+    samples, split_of, conclusion, decisions = _plan_context(
+        store, args.version_id, args.split_id, args.threshold
+    )
+    conflicts = find_conflicts(
+        constraints, _distinct_pairs(decisions), len(samples)
+    )
+    units = bound_units(
+        sorted(split_of), conclusion.groups, constraints, conflicts
+    )
+    violations = evaluate_constraints(samples, split_of, units, constraints)
+    print(
+        f"方案检查（数据版本 {args.version_id}，划分版本 "
+        f"{args.split_id or '原始划分'}）："
+        f"{len(conclusion.leakages)} 条泄漏，"
+        f"{len(violations)} 条约束违反，{len(conflicts)} 条未决冲突"
+    )
+    print("约束违反：")
+    _print_violations(violations)
+    print("未决冲突（不自动放宽，需人工处理）：")
+    _print_conflicts(conflicts)
+
+
+def cmd_plan_suggest(args):
+    from .planning import (
+        bound_units,
+        evaluate_constraints,
+        find_conflicts,
+        load_constraints,
+        suggest_moves,
+    )
+
+    store = AuditStore(args.store)
+    constraints = load_constraints(args.constraints)
+    samples, split_of, conclusion, decisions = _plan_context(
+        store, args.version_id, args.split_id, args.threshold
+    )
+    conflicts = find_conflicts(
+        constraints, _distinct_pairs(decisions), len(samples)
+    )
+    units = bound_units(
+        sorted(split_of), conclusion.groups, constraints, conflicts
+    )
+    moves = suggest_moves(
+        samples, split_of, conclusion.edges, units, constraints
+    )
+    violations = evaluate_constraints(samples, split_of, units, constraints)
+    print(f"迁移建议（共 {len(moves)} 条，逐条人工采纳）：")
+    if not moves:
+        print("  （当前划分下没有可建议的泄漏迁移）")
+    for move in moves:
+        _print_move(move)
+    print("当前约束违反：")
+    _print_violations(violations)
+    print("未决冲突（不自动放宽，需人工处理）：")
+    _print_conflicts(conflicts)
+
+
+def cmd_plan_apply(args):
+    from .planning import (
+        apply_moves,
+        bound_units,
+        evaluate_constraints,
+        find_conflicts,
+        load_constraints,
+        suggest_moves,
+    )
+
+    store = AuditStore(args.store)
+    constraints = load_constraints(args.constraints)
+    samples, split_of, conclusion, decisions = _plan_context(
+        store, args.version_id, args.split_id, args.threshold
+    )
+    conflicts = find_conflicts(
+        constraints, _distinct_pairs(decisions), len(samples)
+    )
+    units = bound_units(
+        sorted(split_of), conclusion.groups, constraints, conflicts
+    )
+    moves = suggest_moves(
+        samples, split_of, conclusion.edges, units, constraints
+    )
+    try:
+        assignments = apply_moves(split_of, moves, list(args.adopt or []))
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    new_split_of = dict(split_of)
+    for sample_id, split in assignments.items():
+        new_split_of[sample_id] = split
+    remaining_violations = evaluate_constraints(
+        samples, new_split_of, units, constraints
+    )
+
+    result_split_id = ""
+    if assignments:
+        if not args.new_split_id:
+            raise SystemExit("采纳了迁移建议时必须用 --new-split-id 保存新划分版本")
+        store.save_split(
+            split_id=args.new_split_id,
+            version_id=args.version_id,
+            assignments=assignments,
+            parent_split_id=args.split_id or "",
+            note=f"plan {args.plan_id} 采纳 {list(args.adopt or [])}",
+            created_at=utc_now(),
+        )
+        result_split_id = args.new_split_id
+
+    adopted = set(args.adopt or [])
+    move_records = [
+        {**move, "status": "adopted" if move["id"] in adopted else "pending"}
+        for move in moves
+    ]
+    plan = {
+        "plan_id": args.plan_id,
+        "version_id": args.version_id,
+        "base_split_id": args.split_id or "",
+        "result_split_id": result_split_id,
+        "stage": args.stage,
+        "constraints": constraints,
+        "assignments": assignments,
+        "moves": move_records,
+        "undecided_conflicts": conflicts,
+        "remaining_violations": remaining_violations,
+        "decisions_snapshot": [d.to_dict() for d in decisions],
+        "created_at": utc_now(),
+    }
+    store.save_plan(plan)
+    pending = [m["id"] for m in move_records if m["status"] == "pending"]
+    print(
+        f"已保存划分方案 {args.plan_id}（{args.stage}）："
+        f"采纳 {sorted(adopted) or '无'}，未采纳 {pending or '无'}；"
+        f"结果划分版本 {result_split_id or '（未变更）'}"
+    )
+    print("采纳后仍存在的约束违反：")
+    _print_violations(remaining_violations)
+    print("未决冲突（保留，不自动放宽）：")
+    _print_conflicts(conflicts)
+    if result_split_id:
+        print(
+            f"可用 audit --split-id {result_split_id} 对该划分重开核对；"
+            "原始相似证据（边与分组）不受影响"
+        )
+
+
+def cmd_plan_status(args):
+    from .planning import (
+        bound_units,
+        evaluate_constraints,
+        find_conflicts,
+    )
+
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    samples, split_of, conclusion, decisions = _plan_context(
+        store, plan["version_id"], plan["result_split_id"], args.threshold
+    )
+    constraints = plan["constraints"]
+    conflicts = find_conflicts(
+        constraints, _distinct_pairs(decisions), len(samples)
+    )
+    units = bound_units(
+        sorted(split_of), conclusion.groups, constraints, conflicts
+    )
+    violations = evaluate_constraints(samples, split_of, units, constraints)
+
+    snapshot_pairs = {
+        (d["sample_a"], d["sample_b"]): d["kind"]
+        for d in plan.get("decisions_snapshot", [])
+    }
+    current_pairs = {
+        (d.sample_a, d.sample_b): d.kind for d in decisions
+    }
+    withdrawn = sorted(set(snapshot_pairs) - set(current_pairs))
+    added = sorted(set(current_pairs) - set(snapshot_pairs))
+
+    print(
+        f"方案 {plan['plan_id']}（{plan['stage']}，结果划分 "
+        f"{plan['result_split_id'] or '（未变更）'}）重开核对："
+        f"当前 {len(conclusion.leakages)} 条泄漏，"
+        f"{len(violations)} 条约束违反"
+    )
+    print("人工判定相对采纳时的变化：")
+    if not withdrawn and not added:
+        print("  （无变化）")
+    for pair in withdrawn:
+        print(f"  已撤回：{pair[0]} / {pair[1]}（{snapshot_pairs[pair]}）")
+    for pair in added:
+        print(f"  新增：{pair[0]} / {pair[1]}（{current_pairs[pair]}）")
+
+    changed_samples = {sid for pair in withdrawn + added for sid in pair}
+    print("对已采纳方案的影响：")
+    impacted = False
+    for move in plan.get("moves", []):
+        if move["status"] != "adopted":
+            continue
+        unit = set(move["unit"])
+        if unit & changed_samples:
+            impacted = True
+            print(
+                f"  {move['id']}（{move['unit']} -> {move['to']}）："
+                "判定变化触及该移动的样本，其改善/代价需按上方重算结果复核"
+            )
+    if not impacted:
+        print("  （已采纳的移动不直接触及变化的判定）")
+    print("当前约束违反：")
+    _print_violations(violations)
+    print("未决冲突（保留，不自动放宽）：")
+    _print_conflicts(conflicts)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data-audit", description="训练数据审查系统")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -341,6 +647,57 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--store", required=True)
     report.add_argument("--audit-id", required=True)
     report.set_defaults(func=cmd_report)
+
+    plan_check = sub.add_parser(
+        "plan-check", help="检查候选划分是否满足家族/来源/数量约束"
+    )
+    plan_check.add_argument("--store", required=True)
+    plan_check.add_argument("--version-id", required=True)
+    plan_check.add_argument("--split-id", default="")
+    plan_check.add_argument("--constraints", required=True, help="约束 JSON 文件")
+    plan_check.add_argument("--threshold", type=float, default=0.45)
+    plan_check.set_defaults(func=cmd_plan_check)
+
+    plan_suggest = sub.add_parser(
+        "plan-suggest", help="列出迁移建议：每条改善哪些泄漏、破坏哪些限制"
+    )
+    plan_suggest.add_argument("--store", required=True)
+    plan_suggest.add_argument("--version-id", required=True)
+    plan_suggest.add_argument("--split-id", default="")
+    plan_suggest.add_argument("--constraints", required=True)
+    plan_suggest.add_argument("--threshold", type=float, default=0.45)
+    plan_suggest.set_defaults(func=cmd_plan_suggest)
+
+    plan_apply = sub.add_parser(
+        "plan-apply", help="逐项采纳迁移建议并保存候选/部分采纳/最终方案"
+    )
+    plan_apply.add_argument("--store", required=True)
+    plan_apply.add_argument("--version-id", required=True)
+    plan_apply.add_argument("--split-id", default="")
+    plan_apply.add_argument("--constraints", required=True)
+    plan_apply.add_argument("--plan-id", required=True)
+    plan_apply.add_argument(
+        "--stage",
+        choices=["candidate", "partial", "final"],
+        required=True,
+        help="candidate=候选 / partial=部分采纳 / final=最终划分",
+    )
+    plan_apply.add_argument(
+        "--adopt", nargs="*", default=[], help="采纳的迁移建议 id（如 m1 m3）"
+    )
+    plan_apply.add_argument(
+        "--new-split-id", default="", help="采纳迁移后保存的新划分版本 id"
+    )
+    plan_apply.add_argument("--threshold", type=float, default=0.45)
+    plan_apply.set_defaults(func=cmd_plan_apply)
+
+    plan_status = sub.add_parser(
+        "plan-status", help="重开已保存方案：撤回判定后重算对已采纳方案的影响"
+    )
+    plan_status.add_argument("--store", required=True)
+    plan_status.add_argument("--plan-id", required=True)
+    plan_status.add_argument("--threshold", type=float, default=0.45)
+    plan_status.set_defaults(func=cmd_plan_status)
     return parser
 
 

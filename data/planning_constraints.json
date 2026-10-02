@@ -1,0 +1,6 @@
+{
+  "families": [],
+  "auto_families": true,
+  "source_exclusions": [["web", "curated"]],
+  "min_counts": {"train": 2, "val": 1}
+}

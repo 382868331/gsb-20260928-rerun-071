@@ -27,11 +27,13 @@ class AuditStore:
         self.conclusions_dir = self.root / "conclusions"
         self.decisions_dir = self.root / "decisions"
         self.splits_dir = self.root / "splits"
+        self.plans_dir = self.root / "plans"
         self.index_path = self.root / "index.json"
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self.conclusions_dir.mkdir(parents=True, exist_ok=True)
         self.decisions_dir.mkdir(parents=True, exist_ok=True)
         self.splits_dir.mkdir(parents=True, exist_ok=True)
+        self.plans_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 数据版本 ----
 
@@ -245,6 +247,35 @@ class AuditStore:
 
     def list_conclusions(self) -> list[str]:
         return sorted(p.stem for p in self.conclusions_dir.glob("*.json"))
+
+    # ---- 划分方案（第四轮：候选 / 部分采纳 / 最终，均不可覆盖）----
+
+    def save_plan(self, plan: dict) -> None:
+        """保存一份划分方案记录（含约束、迁移建议采纳状态与快照）。
+
+        方案不可覆盖：修订必须使用新的 plan_id；候选、部分采纳与最终
+        方案各自落盘，之后可分别重开核对。
+        """
+
+        path = self.plans_dir / f"{plan['plan_id']}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"划分方案已存在: {plan['plan_id']}；修订必须使用新的 plan_id"
+            )
+        self._write_json(path, plan)
+        index = self._load_index()
+        index.setdefault("plans", {})[plan["plan_id"]] = {
+            "version_id": plan["version_id"],
+            "stage": plan["stage"],
+            "result_split_id": plan.get("result_split_id", ""),
+        }
+        self._write_index(index)
+
+    def load_plan(self, plan_id: str) -> dict:
+        return self._read_json(self.plans_dir / f"{plan_id}.json")
+
+    def has_plan(self, plan_id: str) -> bool:
+        return (self.plans_dir / f"{plan_id}.json").exists()
 
     # ---- 人工身份判定（只增不改的事件日志）----
 

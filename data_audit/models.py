@@ -21,6 +21,9 @@ class Sample:
     split: str
     text: str
     content_hash: str
+    # 第四轮：样本来源（可选），用于“来源不能同时进入训练与核对范围”
+    # 的约束检查；空串表示未标注来源。
+    source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -32,6 +35,7 @@ class Sample:
             split=data["split"],
             text=data["text"],
             content_hash=data["content_hash"],
+            source=data.get("source", ""),
         )
 
 

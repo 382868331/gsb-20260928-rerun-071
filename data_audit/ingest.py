@@ -1,6 +1,7 @@
 """从 JSONL 清单导入一个数据版本。
 
-每行格式：``{"sample_id": ..., "split": "train|val|test", "text": ...}``。
+每行格式：``{"sample_id": ..., "split": "train|val|test", "text": ...}``；
+可选 ``source`` 字段标注样本来源（第四轮来源互斥约束使用）。
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ def load_dataset(path: str | Path) -> list[Sample]:
                     split=str(row["split"]),
                     text=text,
                     content_hash=sha256_hex(text),
+                    source=str(row.get("source", "")),
                 )
             )
     return samples

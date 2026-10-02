@@ -1,0 +1,6 @@
+{"sample_id": "p1", "split": "train", "source": "web", "text": "甲乙丙丁戊己庚辛"}
+{"sample_id": "p2", "split": "val", "source": "web", "text": "甲乙丙丁戊己庚壬"}
+{"sample_id": "q1", "split": "train", "source": "curated", "text": "子丑寅卯辰巳午未"}
+{"sample_id": "q2", "split": "val", "source": "web", "text": "子丑寅卯辰巳午申"}
+{"sample_id": "r1", "split": "train", "source": "curated", "text": "日月星辰山川湖海"}
+{"sample_id": "r2", "split": "val", "source": "curated", "text": "天地玄黄宇宙洪荒"}

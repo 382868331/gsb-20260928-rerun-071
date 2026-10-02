@@ -1,6 +1,6 @@
 # 训练数据审查系统
 
-三轮实现：
+四轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
@@ -10,6 +10,14 @@
   按样本家族查看迁移影响（区分完全复制 / 局部相似 / 人工确认不同身份）；
   支持跨版本复制式删除样本。撤回判定、删除样本、恢复旧划分后的增量结果
   与该版本完整重算一致。
+- **第四轮**：在多个候选划分之间选择满足隔离要求的方案：用户指定必须整体
+  留在同一区域的样本家族、不能同时进入训练与核对范围的来源、各组最低
+  保留数量；条件互相冲突时指出具体样本与约束，**不自动放宽**。迁移建议
+  逐项采纳，每条建议展示改善哪些泄漏风险、破坏哪些数量或来源限制，未
+  采纳的移动与未决冲突保留在方案里。人工确认不同身份的样本不会被相似
+  关系强行绑进同一家族；撤回该判定后 plan-status 重新说明已采纳方案受
+  到的影响。候选、部分采纳、最终划分分别保存，均可重开核对；任何迁移
+  都不删除原始相似证据。
 
 ## 设计原则
 
@@ -139,6 +147,42 @@ python -m data_audit.cli remove-samples --store ./store --version-id v3 \
 python -m data_audit.cli report --store ./store --audit-id a1
 ```
 
+## 第四轮：候选划分方案
+
+```bash
+# 10) 导入带来源的样本并检查候选划分是否满足约束
+python -m data_audit.cli ingest --store ./store4 --version-id v1 \
+    --input data/planning_samples.jsonl
+python -m data_audit.cli plan-check --store ./store4 --version-id v1 \
+    --constraints data/planning_constraints.json
+
+# 11) 列出迁移建议：每条改善哪些泄漏、破坏哪些数量或来源限制
+python -m data_audit.cli plan-suggest --store ./store4 --version-id v1 \
+    --constraints data/planning_constraints.json
+
+# 12) 逐项采纳（如只采纳 m3），保存部分采纳方案与新划分版本
+python -m data_audit.cli plan-apply --store ./store4 --version-id v1 \
+    --constraints data/planning_constraints.json --plan-id pl1 \
+    --stage partial --adopt m3 --new-split-id sp1
+
+# 13) 候选 / 部分采纳 / 最终划分均可重开核对
+python -m data_audit.cli audit --store ./store4 --version-id v1 \
+    --audit-id a1 --split-id sp1 --no-base
+python -m data_audit.cli plan-status --store ./store4 --plan-id pl1
+```
+
+约束文件（JSON）字段：
+
+- `families`：必须整体留在同一区域的样本家族（样本 id 列表的列表）；
+- `auto_families`：为 true 时近重复组整体作为家族参与绑定；
+- `source_exclusions`：来源互斥对，两端来源不能同时进入训练与核对范围
+  （样本来源由数据清单里的可选 `source` 字段给出）；
+- `min_counts`：各划分的最低保留数量。
+
+冲突处理：家族约束撞上人工确认的不同身份判定、最低保留数量合计超过
+样本总数等情况，逐条指出具体样本与约束并保留为未决冲突，系统不自动
+放宽；撞上人工判定的家族不会被强行绑定。
+
 ## 存储布局
 
 ```
@@ -152,6 +196,8 @@ store/
                                # 判定快照、相对基线的 changes
   splits/<split_id>.json       # 划分版本（不可覆盖）：样本划分的重新安排
   decisions/<version_id>.jsonl # 人工判定事件日志（add / withdraw，只追加）
+  plans/<plan_id>.json       # 划分方案（不可覆盖）：约束、迁移建议及逐项
+                             # 采纳状态、未决冲突、判定快照、结果划分版本
   index.json
 ```
 
@@ -166,4 +212,6 @@ python -m pytest tests/ -q
 CLI 端到端可追溯；第三轮补充：划分迁移重算泄漏且分组保留、家族视图区分
 完全复制/局部相似/人工确认不同身份、桥接在划分迁移下仍不合并、
 删除样本与恢复旧划分后的增量结果与完整重算一致、
-自动基线不跨划分版本沿用。
+自动基线不跨划分版本沿用；第四轮补充：约束违反指出具体样本、冲突不自动
+放宽、迁移建议展示改善与代价、部分采纳可重开核对且相似证据不删除、
+人工不同身份不被强行绑定、撤回判定后已采纳方案影响可重算。
