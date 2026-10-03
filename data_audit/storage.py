@@ -28,10 +28,12 @@ class AuditStore:
         self.decisions_dir = self.root / "decisions"
         self.splits_dir = self.root / "splits"
         self.index_path = self.root / "index.json"
+        self.rolling_dir = self.root / "rolling"
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self.conclusions_dir.mkdir(parents=True, exist_ok=True)
         self.decisions_dir.mkdir(parents=True, exist_ok=True)
         self.splits_dir.mkdir(parents=True, exist_ok=True)
+        self.rolling_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 数据版本 ----
 
@@ -281,6 +283,74 @@ class AuditStore:
                 pair = tuple(sorted((event["sample_a"], event["sample_b"])))
                 active.pop(pair, None)
         return [active[key] for key in sorted(active)]
+
+    # ---- 滚动验证方案（第四轮）----
+    # rolling/<plan_id>/plan.json        方案定义（不可覆盖）
+    # rolling/<plan_id>/rev_<n>.json     每次采纳生成一个新修订（不可覆盖）
+    # rolling/<plan_id>/events.jsonl     标签更正/来源撤回/判定改变事件（只追加）
+    # rolling/<plan_id>/restrictions.jsonl  旧修订的限制标记（只追加，旧方案保留）
+
+    def _rolling_plan_dir(self, plan_id: str) -> Path:
+        return self.rolling_dir / plan_id
+
+    def save_rolling_plan(self, plan: dict) -> None:
+        plan_dir = self._rolling_plan_dir(plan["plan_id"])
+        plan_dir.mkdir(parents=True, exist_ok=False)
+        self._write_json(plan_dir / "plan.json", plan)
+
+    def has_rolling_plan(self, plan_id: str) -> bool:
+        return (self._rolling_plan_dir(plan_id) / "plan.json").exists()
+
+    def load_rolling_plan(self, plan_id: str) -> dict:
+        return self._read_json(self._rolling_plan_dir(plan_id) / "plan.json")
+
+    def save_rolling_revision(self, plan_id: str, record: dict) -> None:
+        path = self._rolling_plan_dir(plan_id) / f"rev_{record['revision']}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"滚动方案修订已存在: {path.name}；新的采纳必须产生新的修订号"
+            )
+        self._write_json(path, record)
+
+    def list_rolling_revisions(self, plan_id: str) -> list[int]:
+        plan_dir = self._rolling_plan_dir(plan_id)
+        revisions = []
+        for path in plan_dir.glob("rev_*.json"):
+            revisions.append(int(path.stem.split("_", 1)[1]))
+        return sorted(revisions)
+
+    def load_rolling_revision(self, plan_id: str, revision: int) -> dict:
+        return self._read_json(
+            self._rolling_plan_dir(plan_id) / f"rev_{revision}.json"
+        )
+
+    def _rolling_events_path(self, plan_id: str) -> Path:
+        return self._rolling_plan_dir(plan_id) / "events.jsonl"
+
+    def append_rolling_event(self, plan_id: str, event: dict) -> None:
+        path = self._rolling_events_path(plan_id)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_rolling_events(self, plan_id: str) -> list[dict]:
+        path = self._rolling_events_path(plan_id)
+        if not path.exists():
+            return []
+        return self._read_jsonl(path)
+
+    def _rolling_restrictions_path(self, plan_id: str) -> Path:
+        return self._rolling_plan_dir(plan_id) / "restrictions.jsonl"
+
+    def append_rolling_restriction(self, plan_id: str, record: dict) -> None:
+        path = self._rolling_restrictions_path(plan_id)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_rolling_restrictions(self, plan_id: str) -> list[dict]:
+        path = self._rolling_restrictions_path(plan_id)
+        if not path.exists():
+            return []
+        return self._read_jsonl(path)
 
     # ---- 索引与基础 IO ----
 

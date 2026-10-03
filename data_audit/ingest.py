@@ -1,6 +1,8 @@
 """从 JSONL 清单导入一个数据版本。
 
-每行格式：``{"sample_id": ..., "split": "train|val|test", "text": ...}``。
+每行格式：{"sample_id": ..., "split": "train|val|test", "text": ...}；
+滚动验证还可选带 collected_at（采集时间）、label_available_at
+（标签实际可见时间）与 source（来源），缺省按始终可见、无来源处理。
 """
 
 from __future__ import annotations
@@ -31,6 +33,9 @@ def load_dataset(path: str | Path) -> list[Sample]:
                     split=str(row["split"]),
                     text=text,
                     content_hash=sha256_hex(text),
+                    collected_at=str(row.get("collected_at", "")),
+                    label_available_at=str(row.get("label_available_at", "")),
+                    source=str(row.get("source", "")),
                 )
             )
     return samples

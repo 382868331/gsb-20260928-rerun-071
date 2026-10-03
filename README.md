@@ -1,6 +1,6 @@
 # 训练数据审查系统
 
-三轮实现：
+四轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
@@ -10,6 +10,14 @@
   按样本家族查看迁移影响（区分完全复制 / 局部相似 / 人工确认不同身份）；
   支持跨版本复制式删除样本。撤回判定、删除样本、恢复旧划分后的增量结果
   与该版本完整重算一致。
+- **第四轮**：滚动验证划分与后到标签。按多个时间截点形成滚动训练轮次，
+  每轮只能采用截点前已可见的信息：采集晚于截点的样本不参与该轮，
+  采集在截点前但标签实际可见时间晚于截点的样本只进入该轮验证范围
+  （当时真正未知的范围），后来补到的标签不会回流进早期训练。规划同时
+  考虑样本家族同侧、来源隔离与每轮最低保留数量；调整项逐项列出对全部
+  轮次的连带影响（改善某轮泄漏可能破坏另一轮数量约束），由用户逐项
+  采纳，冲突只列出、绝不静默放宽。标签更正、来源撤回或人工身份判断
+  改变时列出需要重新审查的轮次，旧方案可标记限制后保留。
 
 ## 设计原则
 
@@ -95,6 +103,51 @@
 - 测试还校验：增量版本重算与一次性全量导入重算结论一致（跨划分复制核对），
   且父/新版本的原始样本数量都不减少。
 
+## 滚动验证（第四轮）
+
+- **可见性**：样本可带 collected_at（采集时间）、label_available_at
+  （标签实际可见时间）与 source（来源）。每轮截点把样本分为
+  train（采集与标签均不晚于截点）/ val（采集不晚于截点、标签后到，
+  即当时真正未知的范围）/ future（采集晚于截点）/ withdrawn（来源已撤回）。
+- **约束**：family_together（家族同侧，家族来自证据快照审查结论，
+  已确认不同身份的样本仍按该判断处理、原始相似证据不删除）、
+  isolated_sources（来源隔离）、min_train / min_val（每轮最低保留
+  数量）。冲突全部列出，不会通过静默放宽条件消失。
+- **调整项与连带影响**：rolling-eval 给出候选调整项，每项的 effects
+  列出各轮冲突变化（解决了什么、新引入了什么）；rolling-adopt 逐项
+  采纳并生成新修订（rev_n 不可覆盖，旧修订原样保留）。
+- **事件与重审**：rolling-event 追加标签更正 / 来源撤回 / 判定改变
+  （只追加）；rolling-review 列出每个事件触发后需要重新审查的轮次；
+  rolling-restrict 把旧修订标记为带限制保留；rolling-verify 重算
+  最新修订并核对各轮采用范围、决定时可见的证据快照与最终划分一致。
+
+```bash
+# 1) 导入带时间与来源的样本并出基线审查（证据快照）
+python -m data_audit.cli ingest --store ./store --version-id v1 --input data/rolling_samples.jsonl
+python -m data_audit.cli audit --store ./store --version-id v1 --audit-id a1 --no-base
+
+# 2) 创建滚动方案：两个截点、最低保留数量、来源隔离
+python -m data_audit.cli rolling-init --store ./store --version-id v1 --audit-id a1 \
+    --plan-id rp1 --rounds r1=2026-02-01,r2=2026-03-01 \
+    --min-train 5 --min-val 1 --isolated-sources srcB
+
+# 3) 查看候选调整项（含各轮连带影响），逐项采纳
+python -m data_audit.cli rolling-eval --store ./store --plan-id rp1
+python -m data_audit.cli rolling-adopt --store ./store --plan-id rp1 --items i2
+
+# 4) 标签更正 / 来源撤回 / 判定改变：列出需要重新审查的轮次
+python -m data_audit.cli rolling-event --store ./store --plan-id rp1 \
+    --kind label_correction --sample-ids rd1 --label-available-at 2026-01-28
+python -m data_audit.cli rolling-event --store ./store --plan-id rp1 \
+    --kind source_withdrawn --source srcB
+python -m data_audit.cli rolling-review --store ./store --plan-id rp1
+
+# 5) 旧方案带限制保留；重新采纳后核对一致性
+python -m data_audit.cli rolling-restrict --store ./store --plan-id rp1 \
+    --revision 1 --note 标签更正后待重审
+python -m data_audit.cli rolling-verify --store ./store --plan-id rp1
+```
+
 ## 使用方法
 
 ```bash
@@ -153,6 +206,11 @@ store/
   splits/<split_id>.json       # 划分版本（不可覆盖）：样本划分的重新安排
   decisions/<version_id>.jsonl # 人工判定事件日志（add / withdraw，只追加）
   index.json
+  rolling/<plan_id>/plan.json  # 滚动方案：轮次截点、约束、证据快照 audit_id
+  rolling/<plan_id>/rev_<n>.json  # 每次采纳生成一个修订（不可覆盖）：
+                               # 已采纳调整项、各轮采用范围、候选调整项
+  rolling/<plan_id>/events.jsonl  # 标签更正/来源撤回/判定改变（只追加）
+  rolling/<plan_id>/restrictions.jsonl  # 旧修订的限制标记（只追加）
 ```
 
 ## 测试
@@ -167,3 +225,7 @@ CLI 端到端可追溯；第三轮补充：划分迁移重算泄漏且分组保�
 完全复制/局部相似/人工确认不同身份、桥接在划分迁移下仍不合并、
 删除样本与恢复旧划分后的增量结果与完整重算一致、
 自动基线不跨划分版本沿用。
+第四轮补充：迟到标签只进当时未知的验证范围、同家族跨截点与来源隔离
+冲突、调整项连带影响（含跨轮）、部分采纳后冲突仍列出、标签更正/
+来源撤回/判定改变触发轮次重审、带限制旧方案保留、重开后采用范围与
+证据快照核对一致。

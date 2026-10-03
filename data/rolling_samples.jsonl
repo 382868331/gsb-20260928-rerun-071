@@ -1,0 +1,10 @@
+{"sample_id": "ra1", "split": "train", "text": "甲乙丙丁戊己庚辛", "collected_at": "2026-01-05", "label_available_at": "2026-01-06", "source": "srcA"}
+{"sample_id": "ra2", "split": "train", "text": "甲乙丙丁戊己庚壬", "collected_at": "2026-01-20", "label_available_at": "2026-02-10", "source": "srcA"}
+{"sample_id": "rb1", "split": "train", "text": "子丑寅卯辰巳午未", "collected_at": "2026-01-15", "label_available_at": "2026-02-15", "source": "srcB"}
+{"sample_id": "rb2", "split": "train", "text": "申酉戌亥乾坤震巽", "collected_at": "2026-01-10", "label_available_at": "2026-01-10", "source": "srcB"}
+{"sample_id": "rc1", "split": "train", "text": "天地玄黄宇宙洪荒", "collected_at": "2026-01-03", "label_available_at": "2026-01-03", "source": "srcC"}
+{"sample_id": "rc2", "split": "train", "text": "日月盈昃辰宿列张", "collected_at": "2026-01-04", "label_available_at": "2026-01-04", "source": "srcC"}
+{"sample_id": "rc3", "split": "train", "text": "寒来暑往秋收冬藏", "collected_at": "2026-01-06", "label_available_at": "2026-01-07", "source": "srcC"}
+{"sample_id": "rd1", "split": "train", "text": "金生丽水玉出昆冈", "collected_at": "2026-01-25", "label_available_at": "2026-02-20", "source": "srcD"}
+{"sample_id": "rd2", "split": "train", "text": "剑号巨阙珠称夜光", "collected_at": "2026-02-05", "label_available_at": "2026-03-05", "source": "srcD"}
+{"sample_id": "re1", "split": "train", "text": "果珍李柰菜重芥姜", "collected_at": "2026-02-15", "label_available_at": "2026-02-16", "source": "srcC"}
