@@ -9,6 +9,14 @@
 ``decide``        记录人工身份判定（distinct 不同身份 / duplicate 同身份）；
 ``withdraw``      撤回一条人工判定（事件日志只追加，旧报告仍可追溯）；
 ``report``        渲染 Markdown 报告（含修订差异、家族迁移、桥接与排除证据）。
+``plan-create``   第四轮：按时间截点创建滚动验证划分方案；
+``plan-propose``  生成调整提案：逐项列出跨全部轮次的连带影响；
+``plan-apply``    逐项采纳提案条目，生成新方案版本（冲突不静默放宽）；
+``plan-review``   标签更正/来源撤回/判定变化后列出需重新审查的轮次；
+``plan-reopen``   重开方案：按当前有效标签与判定重算，生成新方案版本；
+``plan-show``     查看方案的各轮划分、违规与限制；
+``label-correct`` 记录标签可见时间更正事件（只追加，不改原始样本）；
+``source-withdraw`` 记录来源资料撤回事件（只追加）。
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from datetime import datetime, timezone
 
 from .ingest import fingerprint_samples, load_dataset
 from .models import Decision
+from . import rolling
 from .rules import run_near_duplicate_rule
 from .storage import AuditStore
 
@@ -255,6 +264,366 @@ def cmd_report(args: argparse.Namespace) -> None:
     print(render_markdown(conclusion, sample_text))
 
 
+# ---- 第四轮：滚动验证划分方案 ----
+
+
+def _plan_snapshot(store: AuditStore, version_id: str) -> dict:
+    """决定时可见的证据快照：有效标签可见时间、来源、人工判定、撤回来源。"""
+
+    samples = store.load_samples(version_id)
+    events = store.load_plan_events(version_id)
+    info = rolling.effective_info(samples, events)
+    decisions = [
+        decision.to_dict() for decision in store.load_active_decisions(version_id)
+    ]
+    return {
+        "label_visibility": {
+            sid: meta["label_available_at"] for sid, meta in sorted(info.items())
+        },
+        "sources": {sid: meta["source"] for sid, meta in sorted(info.items())},
+        "decisions": decisions,
+        "withdrawn_sources": rolling.withdrawn_sources(events),
+    }
+
+
+def _load_rounds(path: str) -> list[dict]:
+    import json
+    from pathlib import Path
+
+    rounds = json.loads(Path(path).read_text("utf-8"))
+    if not isinstance(rounds, list) or not rounds:
+        raise SystemExit("轮次定义必须是非空列表")
+    seen = set()
+    for spec in rounds:
+        for key in ("round_id", "window_start", "cutoff"):
+            if key not in spec:
+                raise SystemExit(f"轮次缺少字段 {key}: {spec}")
+        if spec["round_id"] in seen:
+            raise SystemExit(f"重复的 round_id: {spec['round_id']}")
+        seen.add(spec["round_id"])
+        if spec["window_start"] >= spec["cutoff"]:
+            raise SystemExit(
+                f"轮次 {spec['round_id']} 的 window_start 必须早于 cutoff"
+            )
+    return rounds
+
+
+def cmd_plan_create(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    if not store.has_version(args.version_id):
+        raise SystemExit(f"版本不存在: {args.version_id}")
+    conclusion = store.load_conclusion(args.audit_id)
+    if conclusion.version_id != args.version_id:
+        raise SystemExit(
+            f"审查 {args.audit_id} 属于版本 {conclusion.version_id}，"
+            f"不能用于 {args.version_id}"
+        )
+    rounds = _load_rounds(args.rounds)
+    samples = store.load_samples(args.version_id)
+    events = store.load_plan_events(args.version_id)
+    info = rolling.effective_info(samples, events)
+    blocked = set(rolling.withdrawn_sources(events))
+    constraints = {
+        "min_per_group": args.min_per_group,
+        "source_isolation": not args.no_source_isolation,
+        "family_cohesion": not args.no_family_cohesion,
+    }
+    assignments, excluded = rolling.default_assignments(rounds, info, blocked)
+    families = rolling.family_map(conclusion.groups)
+    violations = rolling.evaluate(
+        rounds, assignments, info, families, constraints
+    )
+    record = {
+        "plan_id": args.plan_id,
+        "version_id": args.version_id,
+        "audit_id": args.audit_id,
+        "created_at": utc_now(),
+        "status": "active",
+        "restrictions": [],
+        "parent_plan_id": "",
+        "constraints": constraints,
+        "rounds": rounds,
+        "assignments": assignments,
+        "excluded": excluded,
+        "events_applied": len(events),
+        "evidence_snapshot": _plan_snapshot(store, args.version_id),
+        "violations": violations,
+    }
+    store.save_plan(record)
+    print(
+        f"已保存滚动划分方案 {args.plan_id}（版本 {args.version_id}，"
+        f"{len(rounds)} 轮）：{len(violations)} 条待解决违规"
+    )
+    for violation in violations:
+        print(f"  [{violation['type']}] {violation['round_id']}: {violation['detail']}")
+
+
+def cmd_plan_propose(args: argparse.Namespace) -> None:
+    import json
+    from pathlib import Path
+
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    items = []
+    with Path(args.input).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            item = {
+                "round_id": str(row["round_id"]),
+                "sample_id": str(row["sample_id"]),
+                "split": str(row["split"]),
+            }
+            if item["split"] not in (rolling.TRAIN, rolling.VAL):
+                raise SystemExit(
+                    f"第 {line_number} 行 split 只能是 train/val"
+                )
+            items.append(item)
+    if not items:
+        raise SystemExit("提案为空")
+    round_ids = {spec["round_id"] for spec in plan["rounds"]}
+    sample_ids = set(plan["evidence_snapshot"]["label_visibility"])
+    for item in items:
+        if item["round_id"] not in round_ids:
+            raise SystemExit(f"提案引用了不存在的轮次: {item['round_id']}")
+        if item["sample_id"] not in sample_ids:
+            raise SystemExit(f"提案引用了不存在的样本: {item['sample_id']}")
+    samples = store.load_samples(plan["version_id"])
+    events = store.load_plan_events(plan["version_id"])
+    info = rolling.effective_info(samples, events)
+    families = rolling.family_map(store.load_conclusion(plan["audit_id"]).groups)
+    impacts = rolling.proposal_impacts(
+        plan["rounds"], plan["assignments"], info, families,
+        plan["constraints"], items,
+    )
+    record = {
+        "proposal_id": args.proposal_id,
+        "plan_id": args.plan_id,
+        "created_at": utc_now(),
+        "items": items,
+        "impacts": impacts,
+    }
+    store.save_proposal(record)
+    print(f"已保存提案 {args.proposal_id}（基于方案 {args.plan_id}）：")
+    for impact in impacts:
+        item = impact["item"]
+        print(
+            f"  条目 {impact['item_index']}: {item['round_id']} "
+            f"{item['sample_id']} -> {item['split']}："
+            f"解决 {len(impact['resolved'])} 条，引入 {len(impact['introduced'])} 条"
+        )
+        for violation in impact["introduced"]:
+            print(
+                f"    新增冲突 [{violation['type']}] "
+                f"{violation['round_id']}: {violation['detail']}"
+            )
+
+
+def cmd_plan_apply(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    proposal = store.load_proposal(args.proposal_id)
+    if proposal["plan_id"] != args.plan_id:
+        raise SystemExit(
+            f"提案 {args.proposal_id} 基于方案 {proposal['plan_id']}，"
+            f"不能套用到 {args.plan_id}"
+        )
+    if args.items:
+        indices = [int(value) for value in args.items]
+    else:
+        indices = list(range(len(proposal["items"])))
+    for index in indices:
+        if index < 0 or index >= len(proposal["items"]):
+            raise SystemExit(f"提案条目下标越界: {index}")
+    assignments = {rid: dict(a) for rid, a in plan["assignments"].items()}
+    adopted = []
+    for index in indices:
+        item = proposal["items"][index]
+        assignments.setdefault(item["round_id"], {})[item["sample_id"]] = item["split"]
+        adopted.append(item)
+    samples = store.load_samples(plan["version_id"])
+    events = store.load_plan_events(plan["version_id"])
+    info = rolling.effective_info(samples, events)
+    families = rolling.family_map(store.load_conclusion(plan["audit_id"]).groups)
+    violations = rolling.evaluate(
+        plan["rounds"], assignments, info, families, plan["constraints"]
+    )
+    record = {
+        "plan_id": args.new_plan_id,
+        "version_id": plan["version_id"],
+        "audit_id": plan["audit_id"],
+        "created_at": utc_now(),
+        "status": "active",
+        "restrictions": [],
+        "parent_plan_id": plan["plan_id"],
+        "constraints": dict(plan["constraints"]),
+        "rounds": plan["rounds"],
+        "assignments": assignments,
+        "excluded": plan["excluded"],
+        "evidence_snapshot": plan["evidence_snapshot"],
+        "adopted_from_proposal": {
+            "proposal_id": args.proposal_id,
+            "item_indices": indices,
+        },
+        "violations": violations,
+    }
+    store.save_plan(record)
+    print(
+        f"已采纳 {len(adopted)} 条提案条目，生成新方案 {args.new_plan_id}"
+        f"（父方案 {plan['plan_id']} 原样保留）；"
+        f"当前剩余 {len(violations)} 条违规（未采纳的冲突不会静默放宽）："
+    )
+    for violation in violations:
+        print(f"  [{violation['type']}] {violation['round_id']}: {violation['detail']}")
+
+
+def cmd_plan_review(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    all_events = store.load_plan_events(plan["version_id"])
+    events = all_events[plan.get("events_applied", 0):]
+    current_decisions = [
+        decision.to_dict()
+        for decision in store.load_active_decisions(plan["version_id"])
+    ]
+    affected = rolling.affected_rounds(plan, events, current_decisions)
+    if not affected:
+        print(f"方案 {args.plan_id} 无需重新审查的轮次")
+        return
+    restrictions = list(plan.get("restrictions", []))
+    restrictions.append({"at": utc_now(), "affected_rounds": affected})
+    store.update_plan_status(args.plan_id, "restricted", restrictions)
+    print(
+        f"方案 {args.plan_id} 已标记为 restricted（带限制保留，内容不变）；"
+        f"以下轮次需要重新审查："
+    )
+    for entry in affected:
+        print(f"  轮次 {entry['round_id']}：")
+        for reason in entry["reasons"]:
+            print(f"    - {reason['type']}: {reason}")
+
+
+def cmd_plan_reopen(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    audit_id = args.audit_id or plan["audit_id"]
+    conclusion = store.load_conclusion(audit_id)
+    if conclusion.version_id != plan["version_id"]:
+        raise SystemExit(
+            f"审查 {audit_id} 属于版本 {conclusion.version_id}，"
+            f"不能用于 {plan['version_id']}"
+        )
+    samples = store.load_samples(plan["version_id"])
+    events = store.load_plan_events(plan["version_id"])
+    info = rolling.effective_info(samples, events)
+    blocked = set(rolling.withdrawn_sources(events))
+    assignments, excluded = rolling.default_assignments(
+        plan["rounds"], info, blocked
+    )
+    families = rolling.family_map(conclusion.groups)
+    violations = rolling.evaluate(
+        plan["rounds"], assignments, info, families, plan["constraints"]
+    )
+    record = {
+        "plan_id": args.new_plan_id,
+        "version_id": plan["version_id"],
+        "audit_id": audit_id,
+        "created_at": utc_now(),
+        "status": "active",
+        "restrictions": [],
+        "parent_plan_id": plan["plan_id"],
+        "constraints": dict(plan["constraints"]),
+        "rounds": plan["rounds"],
+        "assignments": assignments,
+        "excluded": excluded,
+        "events_applied": len(events),
+        "evidence_snapshot": _plan_snapshot(store, plan["version_id"]),
+        "violations": violations,
+    }
+    store.save_plan(record)
+    if plan["status"] == "active":
+        store.update_plan_status(
+            plan["plan_id"], "superseded", plan.get("restrictions", [])
+        )
+    print(
+        f"已重开方案 {args.new_plan_id}（父方案 {plan['plan_id']} 原样保留）："
+        f"按当前有效标签与人工判定重算，{len(violations)} 条违规"
+    )
+    for violation in violations:
+        print(f"  [{violation['type']}] {violation['round_id']}: {violation['detail']}")
+
+
+def cmd_plan_show(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    plan = store.load_plan(args.plan_id)
+    print(
+        f"方案 {plan['plan_id']}（版本 {plan['version_id']}，审查 "
+        f"{plan['audit_id']}，状态 {plan['status']}）"
+    )
+    for spec in plan["rounds"]:
+        round_id = spec["round_id"]
+        assign = plan["assignments"].get(round_id, {})
+        train = sorted(s for s, sp in assign.items() if sp == rolling.TRAIN)
+        val = sorted(s for s, sp in assign.items() if sp == rolling.VAL)
+        excluded = plan["excluded"].get(round_id, {})
+        print(
+            f"  轮次 {round_id}（窗口 {spec['window_start']} ~ "
+            f"{spec['cutoff']}）：train={train} val={val} 排除={excluded}"
+        )
+    for violation in plan.get("violations", []):
+        print(f"  违规 [{violation['type']}] {violation['round_id']}: {violation['detail']}")
+    for restriction in plan.get("restrictions", []):
+        print(f"  限制（{restriction['at']}）：{restriction['affected_rounds']}")
+
+
+def cmd_label_correct(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    if not store.has_version(args.version_id):
+        raise SystemExit(f"版本不存在: {args.version_id}")
+    samples = store.load_samples(args.version_id)
+    events = store.load_plan_events(args.version_id)
+    info = rolling.effective_info(samples, events)
+    if args.sample_id not in info:
+        raise SystemExit(f"样本不存在: {args.sample_id}")
+    previous = info[args.sample_id]["label_available_at"]
+    store.append_plan_event(
+        {
+            "type": "label_correction",
+            "version_id": args.version_id,
+            "sample_id": args.sample_id,
+            "previous_label_available_at": previous,
+            "label_available_at": args.label_available_at,
+            "note": args.note,
+            "at": utc_now(),
+        }
+    )
+    print(
+        f"已记录标签更正：{args.sample_id} 标签可见时间 "
+        f"{previous or '(无)'} -> {args.label_available_at}"
+        "（事件只追加，原始样本不变；用 plan-review 查看受影响轮次）"
+    )
+
+
+def cmd_source_withdraw(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    if not store.has_version(args.version_id):
+        raise SystemExit(f"版本不存在: {args.version_id}")
+    store.append_plan_event(
+        {
+            "type": "source_withdrawal",
+            "version_id": args.version_id,
+            "source": args.source,
+            "note": args.note,
+            "at": utc_now(),
+        }
+    )
+    print(
+        f"已记录来源撤回：{args.source}"
+        "（事件只追加；用 plan-review 查看受影响轮次，plan-reopen 重开方案）"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data-audit", description="训练数据审查系统")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -341,6 +710,92 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--store", required=True)
     report.add_argument("--audit-id", required=True)
     report.set_defaults(func=cmd_report)
+    plan_create = sub.add_parser(
+        "plan-create", help="创建滚动验证划分方案（按时间截点）"
+    )
+    plan_create.add_argument("--store", required=True)
+    plan_create.add_argument("--plan-id", required=True)
+    plan_create.add_argument("--version-id", required=True)
+    plan_create.add_argument(
+        "--audit-id", required=True,
+        help="家族分组依据的审查结论（人工判定已体现在分组中）",
+    )
+    plan_create.add_argument(
+        "--rounds", required=True,
+        help="轮次定义 JSON 文件：[{round_id, window_start, cutoff}, ...]",
+    )
+    plan_create.add_argument("--min-per-group", type=int, default=2)
+    plan_create.add_argument("--no-source-isolation", action="store_true")
+    plan_create.add_argument("--no-family-cohesion", action="store_true")
+    plan_create.set_defaults(func=cmd_plan_create)
+
+    plan_propose = sub.add_parser(
+        "plan-propose", help="生成调整提案并列出逐项连带影响"
+    )
+    plan_propose.add_argument("--store", required=True)
+    plan_propose.add_argument("--plan-id", required=True)
+    plan_propose.add_argument("--proposal-id", required=True)
+    plan_propose.add_argument(
+        "--input", required=True,
+        help="JSONL 提案条目，每行 {round_id, sample_id, split}",
+    )
+    plan_propose.set_defaults(func=cmd_plan_propose)
+
+    plan_apply = sub.add_parser(
+        "plan-apply", help="逐项采纳提案条目，生成新方案版本"
+    )
+    plan_apply.add_argument("--store", required=True)
+    plan_apply.add_argument("--plan-id", required=True)
+    plan_apply.add_argument("--proposal-id", required=True)
+    plan_apply.add_argument("--new-plan-id", required=True)
+    plan_apply.add_argument(
+        "--items", nargs="*", default=None,
+        help="要采纳的提案条目下标（缺省全部采纳）",
+    )
+    plan_apply.set_defaults(func=cmd_plan_apply)
+
+    plan_review = sub.add_parser(
+        "plan-review", help="列出需要重新审查的轮次并将方案标记为受限"
+    )
+    plan_review.add_argument("--store", required=True)
+    plan_review.add_argument("--plan-id", required=True)
+    plan_review.set_defaults(func=cmd_plan_review)
+
+    plan_reopen = sub.add_parser(
+        "plan-reopen", help="按当前有效标签与判定重算，生成新方案版本"
+    )
+    plan_reopen.add_argument("--store", required=True)
+    plan_reopen.add_argument("--plan-id", required=True)
+    plan_reopen.add_argument("--new-plan-id", required=True)
+    plan_reopen.add_argument(
+        "--audit-id", default="",
+        help="人工判定变化后重新审查得到的 audit_id（缺省沿用原审查）",
+    )
+    plan_reopen.set_defaults(func=cmd_plan_reopen)
+
+    plan_show = sub.add_parser("plan-show", help="查看方案的各轮划分、违规与限制")
+    plan_show.add_argument("--store", required=True)
+    plan_show.add_argument("--plan-id", required=True)
+    plan_show.set_defaults(func=cmd_plan_show)
+
+    label_correct = sub.add_parser(
+        "label-correct", help="记录标签可见时间更正事件（只追加）"
+    )
+    label_correct.add_argument("--store", required=True)
+    label_correct.add_argument("--version-id", required=True)
+    label_correct.add_argument("--sample-id", required=True)
+    label_correct.add_argument("--label-available-at", required=True)
+    label_correct.add_argument("--note", default="")
+    label_correct.set_defaults(func=cmd_label_correct)
+
+    source_withdraw = sub.add_parser(
+        "source-withdraw", help="记录来源资料撤回事件（只追加）"
+    )
+    source_withdraw.add_argument("--store", required=True)
+    source_withdraw.add_argument("--version-id", required=True)
+    source_withdraw.add_argument("--source", required=True)
+    source_withdraw.add_argument("--note", default="")
+    source_withdraw.set_defaults(func=cmd_source_withdraw)
     return parser
 
 

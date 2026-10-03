@@ -9,6 +9,10 @@
       splits/<split_id>.json                    # 划分版本（同一批样本的另一种
                                                 # 训练/测试安排，不可覆盖）
       decisions/<version_id>.jsonl              # 人工判定事件日志（只追加）
+      plans/<plan_id>.json                      # 滚动验证划分方案（划分内容不可变，
+                                                # 仅 status/restrictions 可追加更新）
+      plans/proposals/<proposal_id>.json        # 调整提案（逐项连带影响）
+      plans/events.jsonl                        # 标签更正 / 来源撤回事件（只追加）
       index.json                                # 版本与审查记录索引
 """
 
@@ -27,11 +31,13 @@ class AuditStore:
         self.conclusions_dir = self.root / "conclusions"
         self.decisions_dir = self.root / "decisions"
         self.splits_dir = self.root / "splits"
+        self.plans_dir = self.root / "plans"
         self.index_path = self.root / "index.json"
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         self.conclusions_dir.mkdir(parents=True, exist_ok=True)
         self.decisions_dir.mkdir(parents=True, exist_ok=True)
         self.splits_dir.mkdir(parents=True, exist_ok=True)
+        (self.plans_dir / "proposals").mkdir(parents=True, exist_ok=True)
 
     # ---- 数据版本 ----
 
@@ -281,6 +287,79 @@ class AuditStore:
                 pair = tuple(sorted((event["sample_a"], event["sample_b"])))
                 active.pop(pair, None)
         return [active[key] for key in sorted(active)]
+
+    # ---- 滚动验证划分方案（第四轮）----
+
+    def save_plan(self, record: dict) -> None:
+        """保存划分方案。方案不可覆盖：修订/采纳提案/重开都用新的 plan_id，
+        旧方案原样保留（可被标记为 restricted / superseded）。"""
+
+        path = self.plans_dir / (record["plan_id"] + ".json")
+        if path.exists():
+            raise FileExistsError(
+                "划分方案已存在: " + record["plan_id"]
+                + "；修订必须使用新的 plan_id，旧方案不可覆盖"
+            )
+        self._write_json(path, record)
+        index = self._load_index()
+        index.setdefault("plans", {})[record["plan_id"]] = {
+            "version_id": record["version_id"],
+            "round_count": len(record["rounds"]),
+            "status": record["status"],
+        }
+        self._write_index(index)
+
+    def load_plan(self, plan_id: str) -> dict:
+        return self._read_json(self.plans_dir / (plan_id + ".json"))
+
+    def has_plan(self, plan_id: str) -> bool:
+        return (self.plans_dir / (plan_id + ".json")).exists()
+
+    def update_plan_status(
+        self, plan_id: str, status: str, restrictions: list[dict]
+    ) -> dict:
+        """只更新方案的 status / restrictions（带限制保留旧方案）；
+        各轮划分、证据快照等内容字段保持不变。"""
+
+        record = self.load_plan(plan_id)
+        record["status"] = status
+        record["restrictions"] = list(restrictions)
+        self._write_json(self.plans_dir / (plan_id + ".json"), record)
+        index = self._load_index()
+        if plan_id in index.get("plans", {}):
+            index["plans"][plan_id]["status"] = status
+            self._write_index(index)
+        return record
+
+    def save_proposal(self, record: dict) -> None:
+        path = self.plans_dir / "proposals" / (record["proposal_id"] + ".json")
+        if path.exists():
+            raise FileExistsError("调整提案已存在: " + record["proposal_id"])
+        self._write_json(path, record)
+
+    def load_proposal(self, proposal_id: str) -> dict:
+        return self._read_json(
+            self.plans_dir / "proposals" / (proposal_id + ".json")
+        )
+
+    def _plan_events_path(self) -> Path:
+        return self.plans_dir / "events.jsonl"
+
+    def append_plan_event(self, event: dict) -> None:
+        """追加标签更正 / 来源撤回事件（只追加，从不改写）。"""
+
+        path = self._plan_events_path()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_plan_events(self, version_id: str | None = None) -> list[dict]:
+        path = self._plan_events_path()
+        if not path.exists():
+            return []
+        events = self._read_jsonl(path)
+        if version_id is None:
+            return events
+        return [e for e in events if e.get("version_id") == version_id]
 
     # ---- 索引与基础 IO ----
 

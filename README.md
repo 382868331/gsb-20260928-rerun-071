@@ -1,6 +1,6 @@
 # 训练数据审查系统
 
-三轮实现：
+四轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
@@ -10,6 +10,14 @@
   按样本家族查看迁移影响（区分完全复制 / 局部相似 / 人工确认不同身份）；
   支持跨版本复制式删除样本。撤回判定、删除样本、恢复旧划分后的增量结果
   与该版本完整重算一致。
+- **第四轮**：按多个时间截点的**滚动验证划分方案**。样本带采集时间与标签
+  实际可见时间：某轮训练只能用截点前标签已可见的样本，迟到标签绝不进入
+  早期训练；各轮验证集保留当时真正未知的窗口范围。规划同时考虑样本家族
+  （近重复组）、来源隔离与每组最低保留数量；调整以逐项提案进行，每个条目
+  列出跨全部轮次的连带影响（解决/引入的冲突），用户逐项采纳，冲突不会
+  通过静默放宽条件消失。标签更正、来源撤回、人工判定变化会列出需要重新
+  审查的轮次，旧方案带限制保留，重开生成新方案版本并记录决定时可见的
+  证据快照。
 
 ## 设计原则
 
@@ -46,7 +54,31 @@
 - 每条证据标注两个划分版本下的划分归属（`split_before` / `split_after`）
   与泄漏结论变化（`leakage_before` / `leakage_after`）；
 - 跨家族的局部相似边与人工排除边也列入触及家族的证据
-  （`within_family=false`），桥接样本仍只在跨组构成团时才合并。
+ （`within_family=false`），桥接样本仍只在跨组构成团时才合并。
+
+## 滚动验证划分方案（第四轮）
+
+样本可带 collected_at（采集时间）、label_available_at（标签实际可见时间）
+与 source（来源），均为可选、缺省无限制。方案由若干轮次组成，每轮有
+窗口 (window_start, cutoff]：
+
+- 默认归属：窗口内采集的样本进 val（当时真正未知的范围）；更早采集且
+  标签在截点前已可见的样本进 train；标签迟到的样本排除
+  （label_not_visible），绝不进入早期训练；未采集的样本排除
+  （not_collected_yet）；来源已撤回的样本排除（source_withdrawn）。
+- 约束（只标记、不静默放宽）：late_label_in_train（迟到标签进训练）、
+  val_outside_window（验证超出未知窗口）、family_split（家族同轮跨
+  train/val）、source_straddle（来源同轮跨侧）、min_per_group（家族在
+  某侧数量低于最低保留数量）。家族直接采用审查结论的分组，因此人工
+  确认不同身份的样本对不参与家族约束，其相似证据仍保留在审查结论中。
+- 调整提案：plan-propose 对每个条目独立计算跨全部轮次的连带影响
+  （resolved / introduced）；plan-apply 逐项采纳并生成新方案版本，
+  未采纳或新引入的冲突保留在违规列表中。
+- 变更与重审：label-correct / source-withdraw 只追加事件（原始样本
+  不变）；plan-review 对比方案的证据快照与当前事件、人工判定，列出
+  需要重新审查的轮次并把方案标记为 restricted（内容不变、带限制保留）；
+  plan-reopen 按当前有效标签与判定重算，生成新方案版本，父方案原样
+  保留，各轮采用范围、决定时可见的证据快照与最终划分始终可对应。
 
 ## 分组规则（R001）
 
@@ -137,6 +169,27 @@ python -m data_audit.cli remove-samples --store ./store --version-id v3 \
 
 # 9) 随时查看任意历史审查报告
 python -m data_audit.cli report --store ./store --audit-id a1
+
+# 10) 第四轮：滚动验证划分方案（时间截点 + 后到标签）
+cat > /tmp/rounds.json <<'EOF'
+[{"round_id": "r1", "window_start": "2026-01-01T00:00:00Z", "cutoff": "2026-01-31T00:00:00Z"},
+ {"round_id": "r2", "window_start": "2026-02-01T00:00:00Z", "cutoff": "2026-02-28T00:00:00Z"}]
+EOF
+python -m data_audit.cli ingest --store ./store --version-id rv1 --input data/rolling_samples.jsonl
+python -m data_audit.cli audit --store ./store --version-id rv1 --audit-id ra1 --no-base
+python -m data_audit.cli plan-create --store ./store --plan-id p1 +    --version-id rv1 --audit-id ra1 --rounds /tmp/rounds.json --min-per-group 2
+
+# 调整提案：逐项列出跨轮次连带影响，再逐项采纳（冲突不静默放宽）
+echo '{"round_id": "r2", "sample_id": "b2", "split": "train"}' > /tmp/items.jsonl
+python -m data_audit.cli plan-propose --store ./store --plan-id p1 +    --proposal-id prop1 --input /tmp/items.jsonl
+python -m data_audit.cli plan-apply --store ./store --plan-id p1 +    --proposal-id prop1 --new-plan-id p2 --items 0
+
+# 标签更正 / 来源撤回后：列出需重审的轮次，旧方案带限制保留，再重开
+python -m data_audit.cli label-correct --store ./store --version-id rv1 +    --sample-id b2 --label-available-at 2026-03-10T00:00:00Z
+python -m data_audit.cli source-withdraw --store ./store --version-id rv1 --source S3
+python -m data_audit.cli plan-review --store ./store --plan-id p1
+python -m data_audit.cli plan-reopen --store ./store --plan-id p1 --new-plan-id p3
+python -m data_audit.cli plan-show --store ./store --plan-id p3
 ```
 
 ## 存储布局
@@ -153,6 +206,10 @@ store/
   splits/<split_id>.json       # 划分版本（不可覆盖）：样本划分的重新安排
   decisions/<version_id>.jsonl # 人工判定事件日志（add / withdraw，只追加）
   index.json
+  plans/<plan_id>.json         # 滚动划分方案（内容不可变，仅状态/限制可更新）：
+                               # 各轮划分、排除原因、约束、违规、证据快照
+  plans/proposals/<id>.json    # 调整提案（逐项连带影响 resolved/introduced）
+  plans/events.jsonl           # 标签更正 / 来源撤回事件（只追加）
 ```
 
 ## 测试
@@ -167,3 +224,8 @@ CLI 端到端可追溯；第三轮补充：划分迁移重算泄漏且分组保�
 完全复制/局部相似/人工确认不同身份、桥接在划分迁移下仍不合并、
 删除样本与恢复旧划分后的增量结果与完整重算一致、
 自动基线不跨划分版本沿用。
+第四轮补充：迟到标签不进早期训练、验证保留当时真正未知的窗口、
+家族/来源/最低保留数量约束、提案逐项连带影响与部分采纳（冲突不静默
+放宽）、人工确认不同身份仍按判定处理且相似证据保留、标签更正/来源
+撤回/判定变化后的轮次重审与带限制保留、重开后各轮采用范围与证据
+快照及最终划分的对应、CLI 端到端。

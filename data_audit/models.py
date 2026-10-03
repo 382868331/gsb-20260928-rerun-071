@@ -21,6 +21,11 @@ class Sample:
     split: str
     text: str
     content_hash: str
+    # 第四轮（滚动验证）：采集时间、标签实际可见时间与来源。
+    # 均为可选，空串表示“无时间限制/无来源”，与旧数据兼容。
+    collected_at: str = ""
+    label_available_at: str = ""
+    source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -32,6 +37,9 @@ class Sample:
             split=data["split"],
             text=data["text"],
             content_hash=data["content_hash"],
+            collected_at=data.get("collected_at", ""),
+            label_available_at=data.get("label_available_at", ""),
+            source=data.get("source", ""),
         )
 
 
