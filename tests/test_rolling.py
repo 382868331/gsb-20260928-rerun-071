@@ -312,7 +312,7 @@ def test_per_source_quota_withdrawn_distinguished_from_pending(tmp_path):
     assert by_source["srcB"]["withdrawn"] == []
     assert by_source["srcC"]["have"] == 0
     assert by_source["srcC"]["withdrawn"] == ["sc1"]
-    assert "来源撤回" in by_source["srcC"]["detail"]
+    assert "来源撤销" in by_source["srcC"]["detail"]
     assert "标签尚未可见" not in by_source["srcC"]["detail"]
 
 
@@ -391,3 +391,222 @@ def test_identity_merge_late_label_and_quota_combined(tmp_path):
     assert recovered["restricted_revisions"] == [0]
     # 旧方案文件原样保留。
     assert (store.root / "rolling" / "rp2" / "rev_0.json").exists()
+
+
+# ---- 逐来源配额缺口原因分类：标签未到 / 人工划分调整 /
+#      身份隔离 / 来源撤销 分别记录，实际 train/val 数量保持准确 ----
+
+IDENTITY_ROWS = [
+    {"sample_id": "sa1", "split": "train", "text": "甲乙丙丁戊己庚辛",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-05",
+     "source": "srcA"},
+    {"sample_id": "sa2", "split": "train", "text": "天地玄黄宇宙洪荒",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-05",
+     "source": "srcA"},
+    {"sample_id": "sb1", "split": "train", "text": "子丑寅卯辰巳午未",
+     "collected_at": "2026-01-20", "label_available_at": "2026-02-10",
+     "source": "srcB"},
+    {"sample_id": "sb2", "split": "train", "text": "金生丽水玉出昆冈",
+     "collected_at": "2026-01-10", "label_available_at": "2026-01-10",
+     "source": "srcB"},
+]
+
+
+def build_identity_store(tmp_path, quotas="srcA=2,srcB=2"):
+    import json
+
+    store_path = str(tmp_path / "store")
+    data_path = tmp_path / "identity.jsonl"
+    data_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False)
+                   for row in IDENTITY_ROWS),
+        encoding="utf-8",
+    )
+    main(["ingest", "--store", store_path, "--version-id", "v1",
+          "--input", str(data_path)])
+    # sa1 与 sb1 文本不相似：仅靠人工判定成为同一实体（跨来源重复出现）。
+    main(["decide", "--store", store_path, "--version-id", "v1",
+          "--decision-id", "h1", "--sample-a", "sa1", "--sample-b", "sb1",
+          "--kind", "duplicate", "--note", "同一实体跨来源重复出现"])
+    main(["audit", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a1", "--no-base"])
+    main(["rolling-init", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a1", "--plan-id", "rp1",
+          "--rounds", "r1=2026-02-01,r2=2026-03-01",
+          "--min-train-per-source", quotas])
+    return AuditStore(store_path)
+
+
+def identity_item(store):
+    """取“把 sa1 让入验证范围”的身份隔离调整项。"""
+    revision = store.load_rolling_revision("rp1", 0)
+    item = next(
+        item for item in revision["suggestions"]
+        if item["samples"] == ["sa1"] and item["to"] == "val"
+    )
+    assert item["cause"] == "identity_isolation"
+    return item
+
+
+def test_identity_isolated_sample_not_counted_as_pending(tmp_path):
+    """标签截点前已可见、为同实体隔离人工让入验证侧：不是 pending_label。"""
+    store = build_identity_store(tmp_path)
+    item = identity_item(store)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+
+    evaluation = evaluate_plan(samples, families, plan, [item])
+    r1 = round_of(evaluation, "r1")
+
+    # 实际数量保持准确：sa1 确实在验证侧、不在训练侧。
+    assert "sa1" in r1["val"] and "sa1" not in r1["train"]
+    assert len(r1["train"]) == 2 and len(r1["val"]) == 2
+
+    # 落盘明细：sa1 进身份隔离让入验证侧桶，绝不进标签未到桶；
+    # sb1 才是自然晚到标签。
+    src_a = r1["source_status"]["srcA"]
+    assert src_a.get("val") is None
+    assert src_a["val_identity"] == ["sa1"]
+    assert r1["source_status"]["srcB"]["val"] == ["sb1"]
+
+    hits = violations_of(evaluation, "r1", "min_train_per_source")
+    hit_a = next(v for v in hits if v["source"] == "srcA")
+    assert hit_a["have"] == 1 and hit_a["need"] == 2
+    assert hit_a["pending_label"] == []
+    assert hit_a["identity_isolation"] == ["sa1"]
+    assert hit_a["manual_reassignment"] == []
+    assert "身份隔离" in hit_a["detail"]
+    assert "等待标签" in hit_a["detail"] or "标签尚未可见" not in hit_a["detail"]
+
+
+def test_manual_drop_distinguished_from_identity_isolation(tmp_path):
+    """来源隔离导致的人工剔除归 manual_reassignment，不归身份隔离。"""
+    store = build_identity_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    revision = store.load_rolling_revision("rp1", 0)
+    # 旧落盘格式兼容：删掉 cause 后，按调整理由仍能判定原因。
+    legacy_item = dict(
+        next(item for item in revision["suggestions"]
+             if item["samples"] == ["sa1"] and item["to"] == "drop")
+    )
+    legacy_item.pop("cause", None)
+
+    evaluation = evaluate_plan(samples, families, plan, [legacy_item])
+    r1 = round_of(evaluation, "r1")
+    # 家族原因（让同实体同侧）的剔除仍是身份隔离。
+    assert r1["source_status"]["srcA"]["identity_isolation"] == ["sa1"]
+    hits = violations_of(evaluation, "r1", "min_train_per_source")
+    hit_a = next(v for v in hits if v["source"] == "srcA")
+    assert hit_a["identity_isolation"] == ["sa1"]
+    assert hit_a["pending_label"] == [] and hit_a["manual_reassignment"] == []
+
+
+def test_withdrawn_after_manual_move_counts_as_withdrawn(tmp_path):
+    """人工移动后来源撤销：缺口按来源撤销记录，样本两侧都不出现。"""
+    store = build_identity_store(tmp_path)
+    item = identity_item(store)
+    main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
+          "--kind", "source_withdrawn", "--source", "srcA"])
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    events = store.load_rolling_events("rp1")
+    overrides, withdrawn = collect_event_overrides(events)
+
+    evaluation = evaluate_plan(
+        samples, families, plan, [item], overrides, withdrawn
+    )
+    r1 = round_of(evaluation, "r1")
+    # sa1 先被身份隔离让入验证侧，随后来源撤销：实际两侧都没有。
+    assert "sa1" not in r1["train"] and "sa1" not in r1["val"]
+    assert "sa1" in r1["withdrawn"]
+    assert r1["source_status"]["srcA"]["withdrawn"] == ["sa1", "sa2"]
+    hits = violations_of(evaluation, "r1", "min_train_per_source")
+    hit_a = next(v for v in hits if v["source"] == "srcA")
+    assert hit_a["have"] == 0
+    assert hit_a["withdrawn"] == ["sa1", "sa2"]
+    assert hit_a["identity_isolation"] == []
+    assert hit_a["pending_label"] == []
+
+
+def test_label_correction_changes_gap_and_old_revision_retained(tmp_path):
+    """标签时间更正后缺口消失；旧修订保留旧解释，不被新解释覆盖。"""
+    store = build_identity_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    rev0 = store.load_rolling_revision("rp1", 0)
+    old_b = next(
+        v for v in round_of(rev0["evaluation"], "r1")["violations"]
+        if v.get("source") == "srcB"
+    )
+    assert old_b["pending_label"] == ["sb1"]
+
+    # 更正：sb1 标签 1 月 15 日已可见（早于 r1 截点），家族不再横跨，
+    # srcB 训练侧也自然达标。
+    main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
+          "--kind", "label_correction", "--sample-ids", "sb1",
+          "--label-available-at", "2026-01-15"])
+    events = store.load_rolling_events("rp1")
+    overrides, withdrawn = collect_event_overrides(events)
+    re_eval = evaluate_plan(samples, families, plan, [], overrides, withdrawn)
+    r1 = round_of(re_eval, "r1")
+    assert "sb1" in r1["train"] and "sa1" in r1["train"]
+    assert r1["violations"] == []
+
+    store.save_rolling_revision("rp1", {
+        "plan_id": "rp1", "revision": 1, "parent_revision": 0,
+        "adopted_items": [], "evaluation": re_eval, "suggestions": [],
+        "event_count": len(events), "created_at": "2026-02-01T00:00:00Z",
+    })
+
+    # 保存重开：新修订核对一致；旧修订原样保留旧解释。
+    recovered = verify_plan(
+        samples, families, plan,
+        store.load_rolling_revision("rp1", 1), events, [],
+    )
+    assert recovered["ok"]
+    stale = verify_plan(samples, families, plan, rev0, events, [])
+    assert not stale["ok"]
+    rev0_reloaded = store.load_rolling_revision("rp1", 0)
+    old_b_reloaded = next(
+        v for v in round_of(rev0_reloaded["evaluation"], "r1")["violations"]
+        if v.get("source") == "srcB"
+    )
+    assert old_b_reloaded["pending_label"] == ["sb1"]
+    assert (store.root / "rolling" / "rp1" / "rev_0.json").exists()
+
+
+def test_new_cutoff_plan_does_not_change_old_revision(tmp_path):
+    """新截点派生新方案：旧方案旧修订的数量与解释不被新解释覆盖。"""
+    store = build_identity_store(tmp_path)
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    rev0_old = store.load_rolling_revision("rp1", 0)
+    old_train = round_of(rev0_old["evaluation"], "r1")["train"]
+    old_b = next(
+        v for v in round_of(rev0_old["evaluation"], "r1")["violations"]
+        if v.get("source") == "srcB"
+    )
+    assert old_b["pending_label"] == ["sb1"]
+
+    # 同样的数据与证据快照，派生一组更晚截点的新方案。
+    main(["rolling-init", "--store", str(store.root), "--version-id", "v1",
+          "--audit-id", "a1", "--plan-id", "rp2",
+          "--rounds", "r1=2026-03-01",
+          "--min-train-per-source", "srcA=2,srcB=2"])
+    plan2 = store.load_rolling_plan("rp2")
+    new_eval = evaluate_plan(samples, families, plan2)
+    assert round_of(new_eval, "r1")["violations"] == []
+
+    # 旧方案与旧修订完全不变。
+    rev0_after = store.load_rolling_revision("rp1", 0)
+    assert round_of(rev0_after["evaluation"], "r1")["train"] == old_train
+    old_b_after = next(
+        v for v in round_of(rev0_after["evaluation"], "r1")["violations"]
+        if v.get("source") == "srcB"
+    )
+    assert old_b_after["pending_label"] == ["sb1"]

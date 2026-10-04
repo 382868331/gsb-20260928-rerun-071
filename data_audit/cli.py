@@ -299,8 +299,11 @@ def _print_evaluation(evaluation: dict) -> None:
                         ("train", "train"),
                         ("val(标签未到)", "val"),
                         ("future", "future"),
-                        ("撤回", "withdrawn"),
-                        ("移出", "held_out"),
+                        ("val(身份隔离)", "val_identity"),
+                        ("val(人工调整)", "val_manual"),
+                        ("身份隔离剔除", "identity_isolation"),
+                        ("人工调整剔除", "manual_reassignment"),
+                        ("来源撤销", "withdrawn"),
                     )
                 )
                 parts.append(f"{source or '(无来源)'}[{{}}]".format(counts))

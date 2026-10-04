@@ -89,6 +89,24 @@ def _item_applies(item: dict, round_id: str, round_ids: list[str]) -> bool:
     return False
 
 
+def item_cause(item: dict) -> str:
+    """调整项造成的缺口原因：身份隔离 / 人工划分调整。
+
+    新旧划分调整中，为避免同一实体同时出现在 train/val 两侧而做的
+    移动（家族横跨）归为 identity_isolation；其余人工划分调整
+    （如来源隔离剔除）归为 manual_reassignment。旧落盘修订里没有
+    cause 字段时，按调整理由回退判定，保证重开后原因仍可追溯。
+    """
+
+    cause = item.get("cause")
+    if cause in ("identity_isolation", "manual_reassignment"):
+        return cause
+    reason = item.get("reason", "")
+    if reason.startswith("家族"):
+        return "identity_isolation"
+    return "manual_reassignment"
+
+
 def _apply_items(
     train: list[str],
     val: list[str],
@@ -112,6 +130,38 @@ def _apply_items(
                 val_set.add(sample_id)
             # to == "drop"：本轮（及之后各轮，视作用域）不再采用
     return sorted(train_set), sorted(val_set)
+
+
+def _apply_items_tracked(
+    base_train: list[str],
+    base_val: list[str],
+    items: list[dict],
+    round_id: str,
+    round_ids: list[str],
+) -> tuple[list[str], list[str], dict[str, dict]]:
+    """应用调整项，并记录每个样本最后一次生效的调整项。
+
+    同一样本可被多项调整先后作用（如先为身份隔离移到验证侧，
+    之后又被另一项剔除），以最后一次生效的调整项为准归类。
+    """
+
+    train_set = set(base_train)
+    val_set = set(base_val)
+    moved_by: dict[str, dict] = {}
+    for item in items:
+        if not _item_applies(item, round_id, round_ids):
+            continue
+        for sample_id in item["samples"]:
+            if sample_id not in train_set and sample_id not in val_set:
+                continue
+            train_set.discard(sample_id)
+            val_set.discard(sample_id)
+            if item["to"] == "train":
+                train_set.add(sample_id)
+            elif item["to"] == "val":
+                val_set.add(sample_id)
+            moved_by[sample_id] = item
+    return sorted(train_set), sorted(val_set), moved_by
 
 
 def round_violations(
@@ -201,8 +251,10 @@ def round_violations(
         )
 
     # 逐来源族最低保留：整体数量足够不能代替各来源族分别达标；
-    # 不足时列出可用数量与缺口原因（标签尚未可见 / 来源已撤回），
-    # 不通过借用别组样本伪造达标。
+    # 不足时分别列出四类数量缺口（标签尚未可见 / 人工划分调整 /
+    # 身份隔离 / 来源已撤回），不通过借用别组样本伪造达标。
+    # 注意：标签在截点前已可见、但为同一实体隔离（家族同侧）等被人工
+    # 移到另一侧或移出的样本，不计 pending_label、不能解释成等待标签。
     source_status = source_status or {}
     for side, current, key in (
         ("train", train, "min_train_per_source"),
@@ -217,7 +269,31 @@ def round_violations(
             if have >= need:
                 continue
             buckets = source_status.get(source, {})
-            pending = buckets.get("val", []) if side == "train" else []
+            # 训练侧缺口：自然晚到标签在 val 桶；被身份隔离项让入验证侧的
+            # 在 val_identity 桶；被人工调整项让入验证侧的在 val_manual 桶；
+            # 两侧都被剔除的在 identity_isolation / manual_reassignment 桶。
+            # 验证侧缺口只可能来自被剔除项与撤回；晚到标签样本本来就在验证侧。
+            pending = (
+                buckets.get("val", [])
+                if side == "train"
+                else []
+            )
+            identity = sorted(
+                set(buckets.get("identity_isolation", []))
+                | (
+                    set(buckets.get("val_identity", []))
+                    if side == "train"
+                    else set()
+                )
+            )
+            manual = sorted(
+                set(buckets.get("manual_reassignment", []))
+                | (
+                    set(buckets.get("val_manual", []))
+                    if side == "train"
+                    else set()
+                )
+            )
             withdrawn = buckets.get("withdrawn", [])
             reasons = []
             if pending:
@@ -225,9 +301,20 @@ def round_violations(
                     f"{len(pending)} 个样本标签尚未可见"
                     f"（{', '.join(pending)}，只能留在当时未知的验证范围）"
                 )
+            if identity:
+                reasons.append(
+                    f"{len(identity)} 个样本为同一实体身份隔离而移出{side_name}侧"
+                    f"（{', '.join(identity)}，标签在截点前已可见，"
+                    "不是等待标签）"
+                )
+            if manual:
+                reasons.append(
+                    f"{len(manual)} 个样本因人工划分调整移出{side_name}侧"
+                    f"（{', '.join(manual)}）"
+                )
             if withdrawn:
                 reasons.append(
-                    f"{len(withdrawn)} 个样本因来源撤回不可用"
+                    f"{len(withdrawn)} 个样本因来源撤销不可用"
                     f"（{', '.join(withdrawn)}）"
                 )
             reason_text = "；".join(reasons) or "该来源族样本总量不足"
@@ -240,6 +327,8 @@ def round_violations(
                     "have": have,
                     "need": need,
                     "pending_label": pending,
+                    "identity_isolation": identity,
+                    "manual_reassignment": manual,
                     "withdrawn": withdrawn,
                     "detail": (
                         f"来源族 {source} 在该轮{side_name}侧可用 {have} 个，"
@@ -279,29 +368,52 @@ def evaluate_plan(
         membership = round_membership(
             samples, cutoff, label_overrides, withdrawn_sources
         )
-        train, val = _apply_items(
-            membership["train"], membership["val"],
+        base_train, base_val = membership["train"], membership["val"]
+        train, val, moved_by = _apply_items_tracked(
+            base_train, base_val,
             adopted_items, round_id, round_ids,
         )
-        # 逐来源族可用量明细：区分 train / val（标签尚未可见，当时真正
-        # 未知）/ future（采集晚于截点）/ withdrawn（来源已撤回）/
-        # held_out（被已采纳调整项移出），解释各组数量缺口的来源。
+        # 逐来源族可用量明细，缺口原因分桶分别记录：
+        # train / val（标签尚未可见，当时真正未知的自然归属）/
+        # future（采集晚于截点）/ withdrawn（来源已撤销）/
+        # val_identity（标签已可见，为同一实体身份隔离被人工让入验证侧）/
+        # val_manual（其他人工划分调整让入验证侧）/
+        # identity_isolation（身份隔离而被剔除，两侧都不采用）/
+        # manual_reassignment（其他人工调整剔除）。
+        # 人工移动的样本不得进入 val 桶，也就不会被解释成等待标签。
         train_set, val_set = set(train), set(val)
         future_set = set(membership["future"])
         withdrawn_set = set(membership["withdrawn"])
+        natural = {sid: "train" for sid in base_train}
+        natural.update({sid: "val" for sid in base_val})
         source_status: dict[str, dict[str, list[str]]] = {}
         for sample in samples:
             sid = sample.sample_id
-            if sid in train_set:
-                bucket = "train"
-            elif sid in val_set:
-                bucket = "val"
-            elif sid in withdrawn_set:
+            if sid in withdrawn_set:
                 bucket = "withdrawn"
             elif sid in future_set:
                 bucket = "future"
+            elif sid in moved_by:
+                identity = item_cause(moved_by[sid]) == "identity_isolation"
+                if sid in train_set:
+                    bucket = "train"
+                elif sid in val_set:
+                    bucket = "val_identity" if identity else "val_manual"
+                else:
+                    bucket = (
+                        "identity_isolation"
+                        if identity
+                        else "manual_reassignment"
+                    )
+            elif sid in train_set:
+                bucket = "train"
+            elif sid in val_set:
+                # 没有任何调整项作用、按截点可见性自然落在验证侧：
+                # 标签当时确实尚未可见，才是真正的 pending_label。
+                bucket = "val"
             else:
-                bucket = "held_out"
+                # 不会到达（未移动样本必然在自然 train/val 中）。
+                bucket = natural.get(sid, "manual_reassignment")
             source_status.setdefault(sample.source, {}).setdefault(
                 bucket, []
             ).append(sid)
@@ -374,6 +486,7 @@ def suggest_items(
                         "samples": train_members,
                         "to": "val",
                         "scope": "round",
+                        "cause": "identity_isolation",
                         "reason": (
                             f"家族 {family} 在 {round_id} 横跨两侧，"
                             "把训练侧成员让入验证范围（仅本轮）"
@@ -386,6 +499,7 @@ def suggest_items(
                         "samples": train_members,
                         "to": "drop",
                         "scope": "onward",
+                        "cause": "identity_isolation",
                         "reason": (
                             f"家族 {family} 在 {round_id} 横跨两侧，"
                             "自本轮起不再采用训练侧成员"
@@ -400,6 +514,7 @@ def suggest_items(
                         "samples": violation["train_members"],
                         "to": "drop",
                         "scope": "onward",
+                        "cause": "manual_reassignment",
                         "reason": (
                             f"来源 {source} 在 {round_id} 未隔离，"
                             "自本轮起剔除其训练侧样本"
@@ -412,6 +527,7 @@ def suggest_items(
                         "samples": violation["val_members"],
                         "to": "drop",
                         "scope": "round",
+                        "cause": "manual_reassignment",
                         "reason": (
                             f"来源 {source} 在 {round_id} 未隔离，"
                             "本轮不采用其验证侧样本"
