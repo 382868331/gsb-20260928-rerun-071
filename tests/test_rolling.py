@@ -391,3 +391,218 @@ def test_identity_merge_late_label_and_quota_combined(tmp_path):
     assert recovered["restricted_revisions"] == [0]
     # 旧方案文件原样保留。
     assert (store.root / "rolling" / "rp2" / "rev_0.json").exists()
+
+
+# ---- 缺口原因分类修复：标签截点前已可见、为同实体隔离被人工移走的样本，
+# ---- 不能列入 pending_label 或解释为等待标签。 ----
+
+ISOLATION_ROWS = [
+    # srcA：ta1/ta2 标签均在截点前可见。
+    {"sample_id": "ta1", "split": "train", "text": "甲乙丙丁戊己庚辛",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-06",
+     "source": "srcA"},
+    {"sample_id": "ta2", "split": "train", "text": "天地玄黄宇宙洪荒",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-05",
+     "source": "srcA"},
+    # srcB：tb1 标签晚到（真正的 pending_label），tb2 已可见。
+    {"sample_id": "tb1", "split": "train", "text": "金生丽水玉出昆冈",
+     "collected_at": "2026-01-20", "label_available_at": "2026-02-10",
+     "source": "srcB"},
+    {"sample_id": "tb2", "split": "train", "text": "子丑寅卯辰巳午未",
+     "collected_at": "2026-01-10", "label_available_at": "2026-01-10",
+     "source": "srcB"},
+    # srcX：tx1 标签晚到（r1 自然落在 val），与 ta1 被人工确认为同一实体；
+    # tx2 标签已可见，保证 srcX 族在 r1 自身训练侧达标。
+    {"sample_id": "tx1", "split": "val", "text": "寒来暑往秋收冬藏",
+     "collected_at": "2026-01-08", "label_available_at": "2026-02-08",
+     "source": "srcX"},
+    {"sample_id": "tx2", "split": "train", "text": "剑号巨阙珠称夜光",
+     "collected_at": "2026-01-09", "label_available_at": "2026-01-09",
+     "source": "srcX"},
+]
+
+
+def build_isolation_store(tmp_path, quotas="srcA=2,srcB=2,srcX=1"):
+    import json
+
+    store_path = str(tmp_path / "store")
+    data_path = tmp_path / "isolation.jsonl"
+    data_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in ISOLATION_ROWS),
+        encoding="utf-8",
+    )
+    main(["ingest", "--store", store_path, "--version-id", "v1",
+          "--input", str(data_path)])
+    # 人工确认 ta1/tx1 为同一实体（文本不相似，仅人工判定）。
+    main(["decide", "--store", store_path, "--version-id", "v1",
+          "--decision-id", "h1", "--sample-a", "ta1", "--sample-b", "tx1",
+          "--kind", "duplicate", "--note", "跨来源同一实体"])
+    main(["audit", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a1", "--no-base"])
+    main(["rolling-init", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a1", "--plan-id", "rp1",
+          "--rounds", "r1=2026-02-01,r2=2026-03-01",
+          "--min-train", "1", "--isolated-sources", "",
+          "--min-train-per-source", quotas])
+    return AuditStore(store_path)
+
+
+def test_identity_isolation_move_not_counted_as_pending_label(tmp_path):
+    """ta1 标签截点前已可见，为同实体隔离被人工移到验证侧：
+    srcA 训练侧缺口必须归类 identity_held_out，不得列入 pending_label。"""
+    store = build_isolation_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+
+    base = evaluate_plan(samples, families, plan)
+    r1 = round_of(base, "r1")
+    kinds = [v["kind"] for v in r1["violations"]]
+    assert "family_straddle" in kinds  # ta1 训练 / tx1 验证，同实体横跨
+
+    items = suggest_items(samples, families, plan, [])
+    move = next(i for i in items
+                if i["to"] == "val" and i["samples"] == ["ta1"])
+    assert move["cause"] == "identity_isolation"
+    after = evaluate_plan(samples, families, plan, [move])
+    r1_after = round_of(after, "r1")
+
+    # 实际 train/val 数量准确：ta1 确实在验证侧。
+    assert "ta1" in r1_after["val"] and "ta1" not in r1_after["train"]
+    hits = violations_of(after, "r1", "min_train_per_source")
+    by_source = {v["source"]: v for v in hits}
+    srca = by_source["srcA"]
+    assert srca["have"] == 1 and srca["need"] == 2
+    # 缺口是身份隔离人工移出，不是等待标签。
+    assert srca["gap"]["identity_held_out"] == ["ta1"]
+    assert srca["gap"]["pending_label"] == []
+    assert srca["pending_label"] == []
+    assert "隔离" in srca["detail"]
+    assert "标签尚未可见" not in srca["detail"]
+    # srcB 的缺口仍是真正的等待标签，两类原因分开记录。
+    srcb = by_source["srcB"]
+    assert srcb["gap"]["pending_label"] == ["tb1"]
+    assert srcb["gap"]["identity_held_out"] == []
+    assert "标签尚未可见" in srcb["detail"]
+    # 来源明细：ta1 进 manual_adjusted（被移到 val 且标签已可见），
+    # 不进 pending_label/val 桶。
+    status = r1_after["source_status"]["srcA"]
+    assert status["manual_adjusted"] == ["ta1"]
+    assert status.get("pending_label", []) == []
+
+
+def test_isolation_drop_classifies_identity_held_out(tmp_path):
+    """onward 剔除同实体训练成员：缺口归类 identity_held_out。"""
+    store = build_isolation_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    items = suggest_items(samples, families, plan, [])
+    drop = next(i for i in items
+                if i["to"] == "drop" and i["samples"] == ["ta1"])
+    assert drop["cause"] == "identity_isolation"
+    after = evaluate_plan(samples, families, plan, [drop])
+    r1_after = round_of(after, "r1")
+    assert "ta1" not in r1_after["train"] + r1_after["val"]
+    srca = next(v for v in violations_of(after, "r1", "min_train_per_source")
+                if v["source"] == "srcA")
+    assert srca["gap"]["identity_held_out"] == ["ta1"]
+    assert srca["gap"]["pending_label"] == []
+    assert r1_after["source_status"]["srcA"]["identity_held_out"] == ["ta1"]
+
+
+def test_manual_move_then_source_withdrawn_classified_as_withdrawn(tmp_path):
+    """人工移动后来源撤销：撤销优先，缺口归 withdrawn，不保留隔离/等待解释。"""
+    store = build_isolation_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    items = suggest_items(samples, families, plan, [])
+    move = next(i for i in items
+                if i["to"] == "val" and i["samples"] == ["ta1"]
+                and i["cause"] == "identity_isolation")
+    # srcA 随后被撤销：ta1/ta2 全部轮次不可用，撤销优先于任何移动解释。
+    main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
+          "--kind", "source_withdrawn", "--source", "srcA"])
+    events = store.load_rolling_events("rp1")
+    overrides, withdrawn = collect_event_overrides(events)
+    after = evaluate_plan(samples, families, plan, [move], overrides, withdrawn)
+    r1_after = round_of(after, "r1")
+    assert "ta1" in r1_after["withdrawn"]
+    srca = next(v for v in violations_of(after, "r1", "min_train_per_source")
+                if v["source"] == "srcA")
+    assert set(srca["gap"]["withdrawn"]) == {"ta1", "ta2"}
+    assert srca["gap"]["identity_held_out"] == []
+    assert srca["gap"]["pending_label"] == []
+    assert srca["have"] == 0
+
+
+def test_label_time_correction_reclassifies_gap_and_revision_kept(tmp_path):
+    """标签时间更正后重算：pending_label 消失；旧修订保留旧解释不被覆盖。"""
+    store = build_isolation_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+
+    rev0 = store.load_rolling_revision("rp1", 0)
+    old_srcb = next(
+        v for v in round_of(rev0["evaluation"], "r1")["violations"]
+        if v["kind"] == "min_train_per_source" and v["source"] == "srcB"
+    )
+    assert old_srcb["gap"]["pending_label"] == ["tb1"]
+
+    main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
+          "--kind", "label_correction", "--sample-ids", "tb1",
+          "--label-available-at", "2026-01-28"])
+    events = store.load_rolling_events("rp1")
+    overrides, withdrawn = collect_event_overrides(events)
+    re_eval = evaluate_plan(samples, families, plan, [], overrides, withdrawn)
+    # 更正后 tb1 在 r1 可训练，srcB 缺口消失。
+    assert "tb1" in round_of(re_eval, "r1")["train"]
+    assert not violations_of(re_eval, "r1", "min_train_per_source")
+
+    # 落盘新修订；旧修订原样保留旧分类，新解释不覆盖旧修订。
+    store.save_rolling_revision("rp1", {
+        "plan_id": "rp1", "revision": 1, "parent_revision": 0,
+        "adopted_items": [], "evaluation": re_eval, "suggestions": [],
+        "event_count": len(events), "created_at": "2026-02-01T00:00:00Z",
+    })
+    kept = store.load_rolling_revision("rp1", 0)
+    kept_srcb = next(
+        v for v in round_of(kept["evaluation"], "r1")["violations"]
+        if v["kind"] == "min_train_per_source" and v["source"] == "srcB"
+    )
+    assert kept_srcb["gap"]["pending_label"] == ["tb1"]
+    # 保存重开：按事件后状态核对新修订一致。
+    rev1 = store.load_rolling_revision("rp1", 1)
+    result = verify_plan(samples, families, plan, rev1, events, [])
+    assert result["ok"]
+    # 旧修订只覆盖 0 条事件，核对报告过期而非被静默改写。
+    stale = verify_plan(samples, families, plan, kept, events, [])
+    assert not stale["ok"]
+
+
+def test_new_cutoff_plan_derived_independently(tmp_path):
+    """用新截点派生新方案：缺口按新截点重新分类，不沿用旧方案结论。"""
+    store = build_isolation_store(tmp_path)
+    main(["rolling-init", "--store", str(store.root), "--version-id", "v1",
+          "--audit-id", "a1", "--plan-id", "rp2",
+          "--rounds", "r1=2026-03-01", "--min-train", "1",
+          "--isolated-sources", "",
+          "--min-train-per-source", "srcA=2,srcB=2,srcX=1"])
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    plan2 = store.load_rolling_plan("rp2")
+    r1 = round_of(evaluate_plan(samples, families, plan2), "r1")
+    # 更晚截点：tb1 标签已可见，srcB 自然达标，无 pending_label 缺口。
+    assert "tb1" in r1["train"]
+    assert not violations_of(
+        evaluate_plan(samples, families, plan2), "r1", "min_train_per_source"
+    )
+    # 旧方案 rp1 的修订与解释保持不变。
+    old = store.load_rolling_revision("rp1", 0)["evaluation"]
+    old_srcb = next(
+        v for v in round_of(old, "r1")["violations"]
+        if v["kind"] == "min_train_per_source" and v["source"] == "srcB"
+    )
+    assert old_srcb["gap"]["pending_label"] == ["tb1"]

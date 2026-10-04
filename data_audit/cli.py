@@ -296,11 +296,12 @@ def _print_evaluation(evaluation: dict) -> None:
                 counts = ", ".join(
                     f"{name}={len(buckets.get(bucket, []))}"
                     for name, bucket in (
-                        ("train", "train"),
-                        ("val(标签未到)", "val"),
-                        ("future", "future"),
-                        ("撤回", "withdrawn"),
-                        ("移出", "held_out"),
+                       ("train", "train"),
+                        ("val(标签未到)", "pending_label"),
+                       ("future", "future"),
+                       ("撤回", "withdrawn"),
+                        ("人工移到另一侧", "manual_adjusted"),
+                        ("隔离移出", "identity_held_out"),
                     )
                 )
                 parts.append(f"{source or '(无来源)'}[{{}}]".format(counts))
