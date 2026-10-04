@@ -288,6 +288,14 @@ def _print_evaluation(evaluation: dict) -> None:
         )
         print("  train: " + (", ".join(round_eval["train"]) or "（空）"))
         print("  val:   " + (", ".join(round_eval["val"]) or "（空）"))
+        source_status = round_eval.get("source_status")
+        if source_status:
+            for source, entry in sorted(source_status.items()):
+                print(
+                    f"  来源 {source or '（无）'}: 可训练={len(entry['train_ready'])} "
+                    f"标签未到={len(entry['label_pending'])} "
+                    f"未来={len(entry['future'])} 已撤回={len(entry['withdrawn'])}"
+                )
         for violation in round_eval["violations"]:
             print(f"  冲突[{violation['kind']}] {violation['detail']}")
     print(f"未决冲突共 {evaluation['open_conflict_count']} 条（只列出，不静默放宽）")
@@ -322,6 +330,20 @@ def _print_suggestions(items: list[dict]) -> None:
 def cmd_rolling_init(args: argparse.Namespace) -> None:
     from .rolling import evaluate_plan, suggest_items
 
+    def parse_source_min(spec: str, flag: str) -> dict:
+        result = {}
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            source, sep, num = part.partition("=")
+            if not sep or not source.strip() or not num.strip().isdigit():
+                raise SystemExit(
+                    f"{flag} 格式应为 来源=数量，逗号分隔，如 srcA=2,srcB=1：{part}"
+                )
+            result[source.strip()] = int(num.strip())
+        return result
+
     store = AuditStore(args.store)
     if not store.has_version(args.version_id):
         raise SystemExit(f"版本不存在: {args.version_id}")
@@ -346,6 +368,12 @@ def cmd_rolling_init(args: argparse.Namespace) -> None:
         ],
         "min_train": args.min_train,
         "min_val": args.min_val,
+        "min_train_per_source": parse_source_min(
+            args.min_train_per_source, "--min-train-per-source"
+        ),
+        "min_val_per_source": parse_source_min(
+            args.min_val_per_source, "--min-val-per-source"
+        ),
     }
     plan = {
         "plan_id": args.plan_id,
@@ -622,6 +650,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rolling_init.add_argument("--min-train", type=int, default=0)
     rolling_init.add_argument("--min-val", type=int, default=0)
+    rolling_init.add_argument(
+        "--min-train-per-source", default="",
+        help="逐来源族训练侧最低保留量，如 srcA=2,srcB=1；整体达标不能顶替逐组达标",
+    )
+    rolling_init.add_argument(
+        "--min-val-per-source", default="",
+        help="逐来源族验证侧最低保留量，如 srcB=1",
+    )
     rolling_init.add_argument("--isolated-sources", default="")
     rolling_init.add_argument(
         "--no-family-together", action="store_true",

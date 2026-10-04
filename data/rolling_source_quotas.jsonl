@@ -1,0 +1,8 @@
+{"sample_id": "sa1", "split": "train", "text": "甲组晚标签样本一", "collected_at": "2026-01-20", "label_available_at": "2026-02-15", "source": "srcA"}
+{"sample_id": "sa2", "split": "train", "text": "甲组常规样本二", "collected_at": "2026-01-10", "label_available_at": "2026-01-10", "source": "srcA"}
+{"sample_id": "sb1", "split": "train", "text": "乙组晚标签样本一", "collected_at": "2026-01-15", "label_available_at": "2026-02-10", "source": "srcB"}
+{"sample_id": "sb2", "split": "train", "text": "乙组常规样本二", "collected_at": "2026-01-12", "label_available_at": "2026-01-12", "source": "srcB"}
+{"sample_id": "sc1", "split": "train", "text": "丙组常规样本一", "collected_at": "2026-01-03", "label_available_at": "2026-01-03", "source": "srcC"}
+{"sample_id": "sc2", "split": "train", "text": "丙组常规样本二", "collected_at": "2026-01-04", "label_available_at": "2026-01-04", "source": "srcC"}
+{"sample_id": "sd1", "split": "train", "text": "丁组常规样本一", "collected_at": "2026-01-05", "label_available_at": "2026-01-05", "source": "srcD"}
+{"sample_id": "sd2", "split": "train", "text": "丁组常规样本二", "collected_at": "2026-01-06", "label_available_at": "2026-01-06", "source": "srcD"}

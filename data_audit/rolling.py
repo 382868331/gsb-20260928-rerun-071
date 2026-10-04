@@ -79,6 +79,40 @@ def round_membership(
     return result
 
 
+def source_status(
+    samples: list[Sample],
+    cutoff: str,
+    label_overrides: dict[str, str],
+    withdrawn_sources: set[str],
+) -> dict[str, dict[str, list[str]]]:
+    """按来源族列出截点下的可见性分类，解释各组可用数量。
+
+    train_ready：采集与标签均不晚于截点；label_pending：采集已到但标签
+    尚未可见（只能进验证范围，等标签，不是证据被撤销）；future：采集晚于
+    截点；withdrawn：来源证据已撤回（与“标签未到”明确区分，不会混淆）。
+    """
+
+    status: dict[str, dict[str, list[str]]] = {}
+    for sample in sorted(samples, key=lambda item: item.sample_id):
+        source = sample.source or ""
+        entry = status.setdefault(
+            source,
+            {"train_ready": [], "label_pending": [], "future": [], "withdrawn": []},
+        )
+        if sample.source and sample.source in withdrawn_sources:
+            entry["withdrawn"].append(sample.sample_id)
+            continue
+        collected = sample.collected_at
+        label = effective_label_time(sample, label_overrides)
+        if collected and collected > cutoff:
+            entry["future"].append(sample.sample_id)
+        elif label and label > cutoff:
+            entry["label_pending"].append(sample.sample_id)
+        else:
+            entry["train_ready"].append(sample.sample_id)
+    return status
+
+
 def _item_applies(item: dict, round_id: str, round_ids: list[str]) -> bool:
     """round 作用域只影响该轮；onward 作用域影响该轮及之后各轮。"""
 
@@ -123,11 +157,13 @@ def round_violations(
     families: list[list[str]],
     constraints: dict,
     label_overrides: dict[str, str],
+    withdrawn_sources: set[str] | None = None,
 ) -> list[dict]:
     """列出一轮内的全部约束冲突。只列出，绝不静默放宽。"""
 
     violations: list[dict] = []
     train_set, val_set = set(train), set(val)
+    withdrawn_sources = withdrawn_sources or set()
 
     # 可见性：被采纳的调整不能把标签当时不可见的样本放进训练侧。
     for sample_id in train:
@@ -198,6 +234,62 @@ def round_violations(
                 "detail": "该轮验证侧保留数量低于最低要求",
             }
         )
+
+    # 逐来源族最低保留量：整体数量或其他来源达标不能顶替本组，
+    # 也不通过借用别组样本伪造达标；不足时保留失败原因与可用数量。
+    side_names = {"train": "训练", "val": "验证"}
+    for key, side, members in (
+        ("min_train_per_source", "train", train),
+        ("min_val_per_source", "val", val),
+    ):
+        requirements = constraints.get(key, {})
+        for source in sorted(requirements):
+            need = requirements[source]
+            have = sum(
+                1 for sid in members if samples_by_id[sid].source == source
+            )
+            if have >= need:
+                continue
+            pending = sorted(
+                sid for sid, sample in samples_by_id.items()
+                if sample.source == source
+                and (not sample.collected_at or sample.collected_at <= cutoff)
+                and effective_label_time(sample, label_overrides)
+                and effective_label_time(sample, label_overrides) > cutoff
+            )
+            gone = sorted(
+                sid for sid, sample in samples_by_id.items()
+                if sample.source == source and source in withdrawn_sources
+            )
+            reasons = []
+            if pending:
+                reasons.append(
+                    f"标签尚未可见 {len(pending)} 个（{', '.join(pending)}，"
+                    "需等待标签，不等于证据撤销）"
+                )
+            if gone:
+                reasons.append(
+                    f"来源证据已撤回 {len(gone)} 个（{', '.join(gone)}）"
+                )
+            reason_text = "；".join(reasons) if reasons else "该来源样本总量不足"
+            violations.append(
+                {
+                    "kind": f"min_{side}_source",
+                    "round_id": round_id,
+                    "source": source,
+                    "side": side,
+                    "have": have,
+                    "need": need,
+                    "label_pending": pending,
+                    "withdrawn": gone,
+                    "detail": (
+                        f"来源 {source} {side_names[side]}侧保留 {have} "
+                        f"低于该组最低要求 {need}（{reason_text}）；"
+                        "整体数量或其他来源达标不能顶替本组，"
+                        "也不借用别组样本伪造达标"
+                    ),
+                },
+            )
     return violations
 
 
@@ -235,6 +327,7 @@ def evaluate_plan(
         violations = round_violations(
             round_id, cutoff, train, val,
             samples_by_id, families, constraints, label_overrides,
+            withdrawn_sources,
         )
         rounds.append(
             {
@@ -244,6 +337,9 @@ def evaluate_plan(
                 "val": val,
                 "future": membership["future"],
                 "withdrawn": membership["withdrawn"],
+                "source_status": source_status(
+                    samples, cutoff, label_overrides, withdrawn_sources
+                ),
                 "violations": violations,
             }
         )
