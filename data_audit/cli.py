@@ -288,6 +288,23 @@ def _print_evaluation(evaluation: dict) -> None:
         )
         print("  train: " + (", ".join(round_eval["train"]) or "（空）"))
         print("  val:   " + (", ".join(round_eval["val"]) or "（空）"))
+        source_status = round_eval.get("source_status", {})
+        if source_status:
+            parts = []
+            for source in sorted(source_status):
+                buckets = source_status[source]
+                counts = ", ".join(
+                    f"{name}={len(buckets.get(bucket, []))}"
+                    for name, bucket in (
+                        ("train", "train"),
+                        ("val(标签未到)", "val"),
+                        ("future", "future"),
+                        ("撤回", "withdrawn"),
+                        ("移出", "held_out"),
+                    )
+                )
+                parts.append(f"{source or '(无来源)'}[{{}}]".format(counts))
+            print("  来源族分布: " + "; ".join(parts))
         for violation in round_eval["violations"]:
             print(f"  冲突[{violation['kind']}] {violation['detail']}")
     print(f"未决冲突共 {evaluation['open_conflict_count']} 条（只列出，不静默放宽）")
@@ -319,6 +336,23 @@ def _print_suggestions(items: list[dict]) -> None:
         print(f"      连带影响(各轮冲突数): {effects}")
 
 
+def _parse_per_source_quotas(raw: str, flag: str) -> dict[str, int]:
+    """解析 source=数量 逗号清单，如 srcA=2,srcB=1。"""
+
+    quotas: dict[str, int] = {}
+    for spec in (raw or "").split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        source, sep, amount = spec.partition("=")
+        if not sep or not source.strip() or not amount.strip().isdigit():
+            raise SystemExit(
+                f"{flag} 的格式应为 source=数量，逗号分隔，如 srcA=2,srcB=1: {spec}"
+            )
+        quotas[source.strip()] = int(amount.strip())
+    return quotas
+
+
 def cmd_rolling_init(args: argparse.Namespace) -> None:
     from .rolling import evaluate_plan, suggest_items
 
@@ -346,6 +380,12 @@ def cmd_rolling_init(args: argparse.Namespace) -> None:
         ],
         "min_train": args.min_train,
         "min_val": args.min_val,
+        "min_train_per_source": _parse_per_source_quotas(
+            args.min_train_per_source, "--min-train-per-source"
+        ),
+        "min_val_per_source": _parse_per_source_quotas(
+            args.min_val_per_source, "--min-val-per-source"
+        ),
     }
     plan = {
         "plan_id": args.plan_id,
@@ -622,6 +662,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rolling_init.add_argument("--min-train", type=int, default=0)
     rolling_init.add_argument("--min-val", type=int, default=0)
+    rolling_init.add_argument(
+        "--min-train-per-source", default="",
+        help="逐来源族训练侧最低保留量，如 srcA=2,srcB=1；"
+             "整体数量足够不能代替逐组达标",
+    )
+    rolling_init.add_argument(
+        "--min-val-per-source", default="",
+        help="逐来源族验证侧最低保留量，格式同上",
+    )
     rolling_init.add_argument("--isolated-sources", default="")
     rolling_init.add_argument(
         "--no-family-together", action="store_true",

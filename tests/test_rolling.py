@@ -218,3 +218,176 @@ def test_verify_detects_tampered_membership(tmp_path):
     evaluation = evaluate_plan(samples, families, plan, [bad_item])
     kinds = [v["kind"] for v in round_of(evaluation, "r1")["violations"]]
     assert "label_not_visible" in kinds
+
+
+# ---- 逐来源族最低保留：整体数量不能代替逐组达标 ----
+
+PER_SOURCE_ROWS = [
+    {"sample_id": "sa1", "split": "train", "text": "甲乙丙丁戊己庚辛",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-06",
+     "source": "srcA"},
+    {"sample_id": "sa2", "split": "train", "text": "天地玄黄宇宙洪荒",
+     "collected_at": "2026-01-05", "label_available_at": "2026-01-05",
+     "source": "srcA"},
+    {"sample_id": "sb1", "split": "train", "text": "金生丽水玉出昆冈",
+     "collected_at": "2026-01-20", "label_available_at": "2026-02-10",
+     "source": "srcB"},
+    {"sample_id": "sb2", "split": "train", "text": "子丑寅卯辰巳午未",
+     "collected_at": "2026-01-10", "label_available_at": "2026-01-10",
+     "source": "srcB"},
+    {"sample_id": "sc1", "split": "train", "text": "寒来暑往秋收冬藏",
+     "collected_at": "2026-01-06", "label_available_at": "2026-01-07",
+     "source": "srcC"},
+]
+
+
+def build_per_source_store(tmp_path, quotas="srcA=1,srcB=2,srcC=1",
+                           plan_id="rp1", audit_id="a1"):
+    import json
+
+    store_path = str(tmp_path / "store")
+    data_path = tmp_path / "per_source.jsonl"
+    data_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False)
+                   for row in PER_SOURCE_ROWS),
+        encoding="utf-8",
+    )
+    main(["ingest", "--store", store_path, "--version-id", "v1",
+          "--input", str(data_path)])
+    main(["audit", "--store", store_path, "--version-id", "v1",
+          "--audit-id", audit_id, "--no-base"])
+    main(["rolling-init", "--store", store_path, "--version-id", "v1",
+          "--audit-id", audit_id, "--plan-id", plan_id,
+          "--rounds", "r1=2026-02-01,r2=2026-03-01",
+          "--min-train-per-source", quotas])
+    return AuditStore(store_path)
+
+
+def violations_of(evaluation, round_id, kind):
+    return [v for v in round_of(evaluation, round_id)["violations"]
+            if v["kind"] == kind]
+
+
+def test_per_source_quota_not_satisfied_by_overall_count(tmp_path):
+    store = build_per_source_store(tmp_path)
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    evaluation = evaluate_plan(samples, families, plan)
+
+    r1 = round_of(evaluation, "r1")
+    # 整体训练侧有 4 个样本，但 srcB 族只有 sb2 达标：整体数量不能代替逐组达标。
+    assert len(r1["train"]) == 4
+    hits = violations_of(evaluation, "r1", "min_train_per_source")
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["source"] == "srcB" and hit["have"] == 1 and hit["need"] == 2
+    # 缺口原因：sb1 标签尚未可见（不是撤回），可用数量与原因都保留。
+    assert hit["pending_label"] == ["sb1"] and hit["withdrawn"] == []
+    assert "标签尚未可见" in hit["detail"]
+    # 逐来源族可用量明细落盘，区分 val(标签未到)/future/withdrawn。
+    assert r1["source_status"]["srcB"]["val"] == ["sb1"]
+    assert r1["source_status"]["srcB"]["train"] == ["sb2"]
+
+    # 更晚截点标签补到后，该来源族自然达标（不借用别组样本）。
+    assert violations_of(evaluation, "r2", "min_train_per_source") == []
+    assert "sb1" in round_of(evaluation, "r2")["train"]
+
+
+def test_per_source_quota_withdrawn_distinguished_from_pending(tmp_path):
+    store = build_per_source_store(tmp_path)
+    main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
+          "--kind", "source_withdrawn", "--source", "srcC"])
+    plan = store.load_rolling_plan("rp1")
+    samples = store.load_samples("v1")
+    families = store.load_conclusion("a1").groups
+    events = store.load_rolling_events("rp1")
+    overrides, withdrawn = collect_event_overrides(events)
+    evaluation = evaluate_plan(samples, families, plan, [], overrides, withdrawn)
+
+    hits = violations_of(evaluation, "r1", "min_train_per_source")
+    by_source = {v["source"]: v for v in hits}
+    # 同一轮里两种缺口并存：srcB 缺在标签未到，srcC 缺在来源撤回，原因分开记录。
+    assert by_source["srcB"]["pending_label"] == ["sb1"]
+    assert by_source["srcB"]["withdrawn"] == []
+    assert by_source["srcC"]["have"] == 0
+    assert by_source["srcC"]["withdrawn"] == ["sc1"]
+    assert "来源撤回" in by_source["srcC"]["detail"]
+    assert "标签尚未可见" not in by_source["srcC"]["detail"]
+
+
+def test_identity_merge_late_label_and_quota_combined(tmp_path):
+    """组间配额冲突 + 晚标签 + 跨来源身份合并共同发生。
+
+    sa1(srcA) 与 sb1(srcB) 被人工确认为同一实体：合并后的家族在同一轮
+    不能横跨 train/val 两侧；sb1 标签晚到使 srcB 族在 r1 达不到逐组配额。
+    研究者在同一批截点上派生第二个方案（新证据快照），旧方案保持不变；
+    标签更正后重算、保存新修订并核对恢复一致。
+    """
+    store = build_per_source_store(tmp_path)
+    store_path = str(store.root)
+
+    # 人工身份合并：sa1/sb1 同一实体（文本不相似，仅靠人工判定）。
+    main(["decide", "--store", store_path, "--version-id", "v1",
+          "--decision-id", "h1", "--sample-a", "sa1", "--sample-b", "sb1",
+          "--kind", "duplicate", "--note", "跨来源重复出现，同一实体"])
+    main(["audit", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a2", "--no-base"])
+    conclusion = store.load_conclusion("a2")
+    assert [sorted(g) for g in conclusion.groups] == [["sa1", "sb1"]]
+
+    # 派生第二个方案：同样的截点与配额，但用新的证据快照。
+    main(["rolling-init", "--store", store_path, "--version-id", "v1",
+          "--audit-id", "a2", "--plan-id", "rp2",
+          "--rounds", "r1=2026-02-01,r2=2026-03-01",
+          "--min-train-per-source", "srcA=1,srcB=2,srcC=1"])
+    plan2 = store.load_rolling_plan("rp2")
+    samples = store.load_samples("v1")
+    evaluation = evaluate_plan(samples, conclusion.groups, plan2)
+    kinds_r1 = [v["kind"] for v in round_of(evaluation, "r1")["violations"]]
+    # 身份合并后同一实体跨来源：sa1 训练 / sb1 验证（标签晚到）= 家族横跨，
+    # 同时 srcB 族配额缺口仍在，两类冲突共同列出。
+    assert "family_straddle" in kinds_r1
+    assert "min_train_per_source" in kinds_r1
+
+    # 旧方案 rp1 沿用旧证据快照，划分与冲突保持不变。
+    plan1 = store.load_rolling_plan("rp1")
+    old = evaluate_plan(samples, store.load_conclusion("a1").groups, plan1)
+    kinds_old = [v["kind"] for v in round_of(old, "r1")["violations"]]
+    assert "family_straddle" not in kinds_old
+    assert store.load_rolling_revision("rp1", 0)["evaluation"]["rounds"][0][
+        "train"] == round_of(old, "r1")["train"]
+
+    # 标签更正：sb1 实际 1 月 28 日已可见 → r1 可训练，配额与家族约束同时达标。
+    main(["rolling-event", "--store", store_path, "--plan-id", "rp2",
+          "--kind", "label_correction", "--sample-ids", "sb1",
+          "--label-available-at", "2026-01-28"])
+    events = store.load_rolling_events("rp2")
+    reviews = affected_rounds(samples, plan2, events)
+    assert reviews[0]["rounds"] == ["r1", "r2"]
+    overrides, withdrawn = collect_event_overrides(events)
+    re_eval = evaluate_plan(samples, conclusion.groups, plan2, [],
+                            overrides, withdrawn)
+    r1 = round_of(re_eval, "r1")
+    assert "sb1" in r1["train"]
+    assert r1["violations"] == []
+
+    # 保存恢复：旧修订在新事件后核对不一致；按事件后可见性落盘新修订后一致。
+    rev0 = store.load_rolling_revision("rp2", 0)
+    stale = verify_plan(samples, conclusion.groups, plan2, rev0, events, [])
+    assert not stale["ok"]
+    store.save_rolling_revision("rp2", {
+        "plan_id": "rp2", "revision": 1, "parent_revision": 0,
+        "adopted_items": [], "evaluation": re_eval, "suggestions": [],
+        "event_count": len(events), "created_at": "2026-02-01T00:00:00Z",
+    })
+    main(["rolling-restrict", "--store", store_path, "--plan-id", "rp2",
+          "--revision", "0", "--note", "标签更正前的旧方案，带限制保留"])
+    rev1 = store.load_rolling_revision("rp2", 1)
+    restrictions = store.load_rolling_restrictions("rp2")
+    recovered = verify_plan(samples, conclusion.groups, plan2, rev1,
+                            events, restrictions)
+    assert recovered["ok"]
+    assert recovered["restricted_revisions"] == [0]
+    # 旧方案文件原样保留。
+    assert (store.root / "rolling" / "rp2" / "rev_0.json").exists()

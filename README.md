@@ -112,7 +112,15 @@
 - **约束**：family_together（家族同侧，家族来自证据快照审查结论，
   已确认不同身份的样本仍按该判断处理、原始相似证据不删除）、
   isolated_sources（来源隔离）、min_train / min_val（每轮最低保留
-  数量）。冲突全部列出，不会通过静默放宽条件消失。
+  数量）、min_train_per_source / min_val_per_source（**逐来源族**
+  最低保留量）：每个来源族在每轮 train/val 侧分别达标，整体数量
+  足够不能代替逐组达标，也不借用别组样本凑数。逐组不达标时保留
+  失败原因与可用数量，并区分“标签尚未可见”（只能留在当时未知的
+  验证范围，之后可能转为可训练）与“来源已撤回”（全部轮次不可用）；
+  每轮落盘 source_status 明细（train / val(标签未到) / future /
+  撤回 / 移出），解释各组数量缺口。同一实体跨来源重复出现（人工
+  确认同身份）时，家族同侧约束保证它不会同时泄漏到 train 与 val
+  两侧。冲突全部列出，不会通过静默放宽条件消失。
 - **调整项与连带影响**：rolling-eval 给出候选调整项，每项的 effects
   列出各轮冲突变化（解决了什么、新引入了什么）；rolling-adopt 逐项
   采纳并生成新修订（rev_n 不可覆盖，旧修订原样保留）。
@@ -129,7 +137,8 @@ python -m data_audit.cli audit --store ./store --version-id v1 --audit-id a1 --n
 # 2) 创建滚动方案：两个截点、最低保留数量、来源隔离
 python -m data_audit.cli rolling-init --store ./store --version-id v1 --audit-id a1 \
     --plan-id rp1 --rounds r1=2026-02-01,r2=2026-03-01 \
-    --min-train 5 --min-val 1 --isolated-sources srcB
+    --min-train 5 --min-val 1 --isolated-sources srcB \
+    --min-train-per-source srcA=2,srcB=1 --min-val-per-source srcB=1
 
 # 3) 查看候选调整项（含各轮连带影响），逐项采纳
 python -m data_audit.cli rolling-eval --store ./store --plan-id rp1
@@ -229,3 +238,7 @@ CLI 端到端可追溯；第三轮补充：划分迁移重算泄漏且分组保�
 冲突、调整项连带影响（含跨轮）、部分采纳后冲突仍列出、标签更正/
 来源撤回/判定改变触发轮次重审、带限制旧方案保留、重开后采用范围与
 证据快照核对一致。
+逐来源族约束补充：整体数量足够不能代替逐组达标、缺口原因区分
+“标签尚未可见”与“来源已撤回”并保留可用数量、晚标签+来源撤回+
+跨来源身份合并共同发生时的分配与保存恢复（派生新方案后旧方案
+划分不变、标签更正重算落盘新修订、带限制旧修订保留且核对一致）。

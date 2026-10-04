@@ -123,6 +123,7 @@ def round_violations(
     families: list[list[str]],
     constraints: dict,
     label_overrides: dict[str, str],
+    source_status: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[dict]:
     """列出一轮内的全部约束冲突。只列出，绝不静默放宽。"""
 
@@ -198,6 +199,56 @@ def round_violations(
                 "detail": "该轮验证侧保留数量低于最低要求",
             }
         )
+
+    # 逐来源族最低保留：整体数量足够不能代替各来源族分别达标；
+    # 不足时列出可用数量与缺口原因（标签尚未可见 / 来源已撤回），
+    # 不通过借用别组样本伪造达标。
+    source_status = source_status or {}
+    for side, current, key in (
+        ("train", train, "min_train_per_source"),
+        ("val", val, "min_val_per_source"),
+    ):
+        side_name = "训练" if side == "train" else "验证"
+        per_source = constraints.get(key, {})
+        for source, need in sorted(per_source.items()):
+            have = len(
+                [s for s in current if samples_by_id[s].source == source]
+            )
+            if have >= need:
+                continue
+            buckets = source_status.get(source, {})
+            pending = buckets.get("val", []) if side == "train" else []
+            withdrawn = buckets.get("withdrawn", [])
+            reasons = []
+            if pending:
+                reasons.append(
+                    f"{len(pending)} 个样本标签尚未可见"
+                    f"（{', '.join(pending)}，只能留在当时未知的验证范围）"
+                )
+            if withdrawn:
+                reasons.append(
+                    f"{len(withdrawn)} 个样本因来源撤回不可用"
+                    f"（{', '.join(withdrawn)}）"
+                )
+            reason_text = "；".join(reasons) or "该来源族样本总量不足"
+            violations.append(
+                {
+                    "kind": key,
+                    "round_id": round_id,
+                    "source": source,
+                    "side": side,
+                    "have": have,
+                    "need": need,
+                    "pending_label": pending,
+                    "withdrawn": withdrawn,
+                    "detail": (
+                        f"来源族 {source} 在该轮{side_name}侧可用 {have} 个，"
+                        f"低于逐组最低要求 {need} 个（{reason_text}）；"
+                        "整体数量充足不能代替该来源族达标，"
+                        "也不借用其他来源族样本凑数"
+                    ),
+                }
+            )
     return violations
 
 
@@ -232,9 +283,32 @@ def evaluate_plan(
             membership["train"], membership["val"],
             adopted_items, round_id, round_ids,
         )
+        # 逐来源族可用量明细：区分 train / val（标签尚未可见，当时真正
+        # 未知）/ future（采集晚于截点）/ withdrawn（来源已撤回）/
+        # held_out（被已采纳调整项移出），解释各组数量缺口的来源。
+        train_set, val_set = set(train), set(val)
+        future_set = set(membership["future"])
+        withdrawn_set = set(membership["withdrawn"])
+        source_status: dict[str, dict[str, list[str]]] = {}
+        for sample in samples:
+            sid = sample.sample_id
+            if sid in train_set:
+                bucket = "train"
+            elif sid in val_set:
+                bucket = "val"
+            elif sid in withdrawn_set:
+                bucket = "withdrawn"
+            elif sid in future_set:
+                bucket = "future"
+            else:
+                bucket = "held_out"
+            source_status.setdefault(sample.source, {}).setdefault(
+                bucket, []
+            ).append(sid)
         violations = round_violations(
             round_id, cutoff, train, val,
             samples_by_id, families, constraints, label_overrides,
+            source_status,
         )
         rounds.append(
             {
@@ -244,6 +318,7 @@ def evaluate_plan(
                 "val": val,
                 "future": membership["future"],
                 "withdrawn": membership["withdrawn"],
+                "source_status": source_status,
                 "violations": violations,
             }
         )
