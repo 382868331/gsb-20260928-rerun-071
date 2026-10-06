@@ -26,9 +26,13 @@ class Sample:
     collected_at: str = ""
     label_available_at: str = ""
     source: str = ""
+    sources: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if not data["sources"] and self.source:
+            data["sources"] = [self.source]
+        return data
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "Sample":
@@ -40,6 +44,10 @@ class Sample:
             collected_at=data.get("collected_at", ""),
             label_available_at=data.get("label_available_at", ""),
             source=data.get("source", ""),
+            sources=list(
+                data.get("sources")
+                or ([data["source"]] if data.get("source") else [])
+            ),
         )
 
 

@@ -352,6 +352,27 @@ class AuditStore:
             return []
         return self._read_jsonl(path)
 
+    def _quota_batches_path(self, plan_id: str) -> Path:
+        return self._rolling_plan_dir(plan_id) / "quota_batches.jsonl"
+
+    def append_quota_batch(self, plan_id: str, record: dict) -> None:
+        path = self._quota_batches_path(plan_id)
+        for existing in self.load_quota_batches(plan_id):
+            if existing.get("type") != "plan":
+                continue
+            if existing.get("basis_signature") == record.get("basis_signature"):
+                same_strategy = existing.get("selected", {}).get("strategy")
+                if same_strategy == record.get("selected", {}).get("strategy"):
+                    raise FileExistsError("同一时点与数据基础上已有相同方案，不能重复安排标注")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_quota_batches(self, plan_id: str) -> list[dict]:
+        path = self._quota_batches_path(plan_id)
+        if not path.exists():
+            return []
+        return self._read_jsonl(path)
+
     # ---- 索引与基础 IO ----
 
     def _load_index(self) -> dict:

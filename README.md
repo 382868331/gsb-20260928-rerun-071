@@ -1,6 +1,6 @@
 # 训练数据审查系统
 
-四轮实现：
+五轮实现：
 
 - **第一轮**：近重复样本分组与训练/验证（测试）划分泄漏检查；
 - **第二轮**：增量加入样本后的近重复组修订、人工确认同/异身份（可撤回）、
@@ -18,6 +18,12 @@
   轮次的连带影响（改善某轮泄漏可能破坏另一轮数量约束），由用户逐项
   采纳，冲突只列出、绝不静默放宽。标签更正、来源撤回或人工身份判断
   改变时列出需要重新审查的轮次，旧方案可标记限制后保留。
+- **第五轮**：有限标注预算下的来源配额补齐。样本可用 `sources` 列出其实际
+  涉及的多个来源，跨来源人工确认同身份时作为一个身份单位只支付一次标注成本；
+  系统比较“最少新增标注”和“优先补最紧缺来源”两种方案。选择严格按指定截点
+  可见的标签、撤回事件与身份快照计算，迟到资料不回流。来源撤销或身份合并后，
+  旧批次中尚未执行的选择只作废重算，已执行的标注成本作为事实保留；同基础、
+  同方案重开不会重复安排，预算不足时逐来源返回缺口与原因。
 
 ## 设计原则
 
@@ -165,6 +171,33 @@ python -m data_audit.cli rolling-restrict --store ./store --plan-id rp1 \
 python -m data_audit.cli rolling-verify --store ./store --plan-id rp1
 ```
 
+## 来源配额标注（第五轮）
+
+样本可在 JSONL 中使用 `sources: ["srcA", "srcB"]` 表示同一样本实际涉及多个
+来源；这不是把样本复制成两份，因此一次标注只消耗一次预算，并同时保留其来源
+身份关系。人工确认为同一身份的跨来源样本也按同一身份单位处理。
+
+```bash
+# 在 r1 截点比较两种补齐策略，并保存所选策略的下一轮候选批次
+python -m data_audit.cli rolling-quota --store ./store --plan-id rp1 \
+    --cutoff 2026-02-01 --needs srcA=2,srcB=1 --budget 3 \
+    --strategy minimum_new_labels
+python -m data_audit.cli rolling-quota --store ./store --plan-id rp1 \
+    --cutoff 2026-02-01 --needs srcA=2,srcB=1 --budget 3 \
+    --strategy most_shortage_first
+
+# 人工实际核对后登记成本；不登记时后续变化可作废尚未执行的选择
+python -m data_audit.cli rolling-quota-execute --store ./store --plan-id rp1 \
+    --sample-ids multi --at 2026-02-02
+```
+
+历史事件必须给出生效时刻；默认当前时刻只影响不早于该时刻的截点：
+
+```bash
+python -m data_audit.cli rolling-event --store ./store --plan-id rp1 \
+    --kind source_withdrawn --source srcB --at 2026-01-31
+```
+
 ## 使用方法
 
 ```bash
@@ -228,6 +261,7 @@ store/
                                # 已采纳调整项、各轮采用范围、候选调整项
   rolling/<plan_id>/events.jsonl  # 标签更正/来源撤回/判定改变（只追加）
   rolling/<plan_id>/restrictions.jsonl  # 旧修订的限制标记（只追加）
+  rolling/<plan_id>/quota_batches.jsonl # 标注方案、作废记录与已执行成本（只追加）
 ```
 
 ## 测试

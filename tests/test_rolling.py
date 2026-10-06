@@ -119,7 +119,7 @@ def test_label_correction_triggers_review_and_stale_verify(tmp_path):
     store = build_store(tmp_path)
     main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
           "--kind", "label_correction", "--sample-ids", "rd1",
-          "--label-available-at", "2026-01-28"])
+          "--label-available-at", "2026-01-28", "--at", "2026-01-31"])
     plan, samples, families = load_context(store)
     events = store.load_rolling_events("rp1")
 
@@ -145,7 +145,7 @@ def test_label_correction_triggers_review_and_stale_verify(tmp_path):
 def test_source_withdrawn_removes_samples_everywhere(tmp_path):
     store = build_store(tmp_path)
     main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
-          "--kind", "source_withdrawn", "--source", "srcB"])
+          "--kind", "source_withdrawn", "--source", "srcB", "--at", "2026-01-31"])
     plan, samples, families = load_context(store)
     events = store.load_rolling_events("rp1")
     overrides, withdrawn = collect_event_overrides(events)
@@ -361,7 +361,7 @@ def test_identity_merge_late_label_and_quota_combined(tmp_path):
     # 标签更正：sb1 实际 1 月 28 日已可见 → r1 可训练，配额与家族约束同时达标。
     main(["rolling-event", "--store", store_path, "--plan-id", "rp2",
           "--kind", "label_correction", "--sample-ids", "sb1",
-          "--label-available-at", "2026-01-28"])
+          "--label-available-at", "2026-01-28", "--at", "2026-01-31"])
     events = store.load_rolling_events("rp2")
     reviews = affected_rounds(samples, plan2, events)
     assert reviews[0]["rounds"] == ["r1", "r2"]
@@ -549,7 +549,7 @@ def test_label_correction_changes_gap_and_old_revision_retained(tmp_path):
     # srcB 训练侧也自然达标。
     main(["rolling-event", "--store", str(store.root), "--plan-id", "rp1",
           "--kind", "label_correction", "--sample-ids", "sb1",
-          "--label-available-at", "2026-01-15"])
+          "--label-available-at", "2026-01-15", "--at", "2026-01-31"])
     events = store.load_rolling_events("rp1")
     overrides, withdrawn = collect_event_overrides(events)
     re_eval = evaluate_plan(samples, families, plan, [], overrides, withdrawn)

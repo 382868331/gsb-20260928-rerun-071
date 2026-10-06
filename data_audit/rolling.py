@@ -25,6 +25,13 @@ from typing import Any
 from .models import Sample
 
 
+def _sample_sources(sample: Sample) -> list[str]:
+    sources = list(dict.fromkeys(sample.sources))
+    if not sources and sample.source:
+        sources = [sample.source]
+    return sources
+
+
 def effective_label_time(sample: Sample, label_overrides: dict[str, str]) -> str:
     """样本的有效标签可见时间：标签更正事件优先，缺省等于采集时间。"""
 
@@ -47,6 +54,26 @@ def collect_event_overrides(
         elif event["event"] == "source_withdrawn":
             withdrawn_sources.add(event["source"])
     return label_overrides, withdrawn_sources
+
+
+def overrides_as_of(
+    events: list[dict],
+    cutoff: str,
+    fallback_labels: dict[str, str] | None = None,
+    fallback_withdrawn: set[str] | None = None,
+) -> tuple[dict[str, str], set[str]]:
+    """按事件生效时刻过滤；没有事件日志时保留直接传入的兼容参数。"""
+
+    if not events:
+        return dict(fallback_labels or {}), set(fallback_withdrawn or set())
+    labels, withdrawn = collect_event_overrides(
+        [
+            event
+            for event in events
+            if not event.get("at") or event["at"] <= cutoff
+        ]
+    )
+    return labels, withdrawn
 
 
 def round_membership(
@@ -211,10 +238,12 @@ def round_violations(
                     }
                 )
 
-    source_of = {sid: samples_by_id[sid].source for sid in train + val}
+    sample_source_lists = {
+        sid: _sample_sources(samples_by_id[sid]) for sid in train + val
+    }
     for source in constraints.get("isolated_sources", []):
-        train_members = sorted(s for s in train if source_of.get(s) == source)
-        val_members = sorted(s for s in val if source_of.get(s) == source)
+        train_members = sorted(s for s in train if source in sample_source_lists.get(s, []))
+        val_members = sorted(s for s in val if source in sample_source_lists.get(s, []))
         if train_members and val_members:
             violations.append(
                 {
@@ -264,7 +293,10 @@ def round_violations(
         per_source = constraints.get(key, {})
         for source, need in sorted(per_source.items()):
             have = len(
-                [s for s in current if samples_by_id[s].source == source]
+                [
+                    s for s in current
+                    if source in _sample_sources(samples_by_id[s])
+                ]
             )
             if have >= need:
                 continue
@@ -348,6 +380,7 @@ def evaluate_plan(
     adopted_items: list[dict] | None = None,
     label_overrides: dict[str, str] | None = None,
     withdrawn_sources: set[str] | None = None,
+    events: list[dict] | None = None,
 ) -> dict:
     """评估滚动方案：各轮采用范围、可见性划分与全部未决冲突。
 
@@ -365,8 +398,11 @@ def evaluate_plan(
     rounds: list[dict] = []
     for round_def in plan["rounds"]:
         round_id, cutoff = round_def["round_id"], round_def["cutoff"]
+        visible_labels, visible_withdrawn = overrides_as_of(
+            events or [], cutoff, label_overrides, withdrawn_sources
+        )
         membership = round_membership(
-            samples, cutoff, label_overrides, withdrawn_sources
+            samples, cutoff, visible_labels, visible_withdrawn
         )
         base_train, base_val = membership["train"], membership["val"]
         train, val, moved_by = _apply_items_tracked(
@@ -414,12 +450,13 @@ def evaluate_plan(
             else:
                 # 不会到达（未移动样本必然在自然 train/val 中）。
                 bucket = natural.get(sid, "manual_reassignment")
-            source_status.setdefault(sample.source, {}).setdefault(
+            for source in _sample_sources(sample) or [""]:
+                source_status.setdefault(source, {}).setdefault(
                 bucket, []
-            ).append(sid)
+                ).append(sid)
         violations = round_violations(
             round_id, cutoff, train, val,
-            samples_by_id, families, constraints, label_overrides,
+            samples_by_id, families, constraints, visible_labels,
             source_status,
         )
         rounds.append(
@@ -460,6 +497,7 @@ def suggest_items(
     adopted_items: list[dict],
     label_overrides: dict[str, str] | None = None,
     withdrawn_sources: set[str] | None = None,
+    events: list[dict] | None = None,
 ) -> list[dict]:
     """针对当前未决冲突生成候选调整项，并列出每项对各轮的连带影响。
 
@@ -469,7 +507,8 @@ def suggest_items(
     """
 
     base = evaluate_plan(
-        samples, families, plan, adopted_items, label_overrides, withdrawn_sources
+        samples, families, plan, adopted_items, label_overrides, withdrawn_sources,
+        events,
     )
     base_kinds = _violation_kinds(base)
 
@@ -541,7 +580,7 @@ def suggest_items(
         item = {"item_id": f"i{index}", **candidate}
         after = evaluate_plan(
             samples, families, plan, adopted_items + [item],
-            label_overrides, withdrawn_sources,
+            label_overrides, withdrawn_sources, events,
         )
         after_kinds = _violation_kinds(after)
         effects = {}
@@ -612,6 +651,12 @@ def affected_rounds(
                 )
             for sample_id in changed:
                 running_overrides[sample_id] = event["label_available_at"]
+            event_cutoff = event.get("at", "")
+            if event_cutoff:
+                round_ids = {
+                    rid for rid in round_ids
+                    if next(r["cutoff"] for r in rounds if r["round_id"] == rid) >= event_cutoff
+                }
             reviews.append(
                 {
                     "event": kind,
@@ -634,6 +679,12 @@ def affected_rounds(
                     participating(sample_id, running_overrides, running_withdrawn)
                 )
             running_withdrawn.add(source)
+            event_cutoff = event.get("at", "")
+            if event_cutoff:
+                round_ids = {
+                    rid for rid in round_ids
+                    if next(r["cutoff"] for r in rounds if r["round_id"] == rid) >= event_cutoff
+                }
             reviews.append(
                 {
                     "event": kind,
@@ -686,7 +737,7 @@ def verify_plan(
     label_overrides, withdrawn_sources = collect_event_overrides(events)
     recomputed = evaluate_plan(
         samples, families, plan,
-        revision["adopted_items"], label_overrides, withdrawn_sources,
+        revision["adopted_items"], label_overrides, withdrawn_sources, events,
     )
     stored = revision["evaluation"]
 

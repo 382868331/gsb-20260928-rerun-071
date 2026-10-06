@@ -27,6 +27,16 @@ def load_dataset(path: str | Path) -> list[Sample]:
                 raise ValueError(f"重复的 sample_id: {sample_id} (第 {line_number} 行)")
             seen.add(sample_id)
             text = str(row["text"])
+            raw_sources = row.get("sources")
+            if raw_sources is None:
+                raw_sources = [row["source"]] if row.get("source") else []
+            if isinstance(raw_sources, str):
+                raw_sources = [raw_sources]
+            sources = [
+                str(item).strip()
+                for item in raw_sources
+                if str(item).strip()
+            ]
             samples.append(
                 Sample(
                     sample_id=sample_id,
@@ -36,6 +46,7 @@ def load_dataset(path: str | Path) -> list[Sample]:
                     collected_at=str(row.get("collected_at", "")),
                     label_available_at=str(row.get("label_available_at", "")),
                     source=str(row.get("source", "")),
+                    sources=sources,
                 )
             )
     return samples

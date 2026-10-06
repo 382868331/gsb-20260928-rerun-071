@@ -400,8 +400,8 @@ def cmd_rolling_init(args: argparse.Namespace) -> None:
     }
     store.save_rolling_plan(plan)
     samples = store.load_samples(args.version_id)
-    evaluation = evaluate_plan(samples, conclusion.groups, plan)
-    suggestions = suggest_items(samples, conclusion.groups, plan, [])
+    evaluation = evaluate_plan(samples, conclusion.groups, plan, events=[])
+    suggestions = suggest_items(samples, conclusion.groups, plan, [], events=[])
     store.save_rolling_revision(
         args.plan_id,
         {
@@ -450,11 +450,9 @@ def cmd_rolling_adopt(args: argparse.Namespace) -> None:
                 "候选列表中；请先 rolling-eval 查看当前候选项"
             )
         adopted.append(item)
-    evaluation = evaluate_plan(
-        samples, families, plan, adopted, label_overrides, withdrawn
-    )
+    evaluation = evaluate_plan(samples, families, plan, adopted, events=events)
     suggestions = suggest_items(
-        samples, families, plan, adopted, label_overrides, withdrawn
+        samples, families, plan, adopted, events=events
     )
     new_revision = revision["revision"] + 1
     store.save_rolling_revision(
@@ -483,7 +481,7 @@ def cmd_rolling_event(args: argparse.Namespace) -> None:
 
     store = AuditStore(args.store)
     plan, samples, _, events, _, _ = _load_rolling_context(store, args.plan_id)
-    event = {"event": args.kind, "at": utc_now(), "note": args.note}
+    event = {"event": args.kind, "at": args.at or utc_now(), "note": args.note}
     if args.kind == "label_correction":
         if not args.sample_ids or not args.label_available_at:
             raise SystemExit("label_correction 需要 --sample-ids 与 --label-available-at")
@@ -503,6 +501,141 @@ def cmd_rolling_event(args: argparse.Namespace) -> None:
     print(f"已追加事件 {args.kind}（事件日志只追加，原始样本与旧修订不变）")
     print(f"需要重新审查的轮次: {', '.join(hit['rounds']) or '（无）'}")
     print(f"原因: {hit['reason']}")
+
+
+def _quota_events(store: AuditStore, plan_id: str) -> list[dict]:
+    return store.load_quota_batches(plan_id)
+
+
+def _active_quota_plan(events: list[dict]) -> dict | None:
+    superseded = {
+        event["batch_id"]
+        for event in events
+        if event.get("type") == "supersede"
+    }
+    plans = [event for event in events if event.get("type") == "plan"]
+    for event in reversed(plans):
+        if event["batch_id"] not in superseded:
+            return event
+    return None
+
+
+def _spent_quota_ids(events: list[dict], cutoff: str) -> set[str]:
+    spent = set()
+    for event in events:
+        if event.get("type") != "execute":
+            continue
+        if event.get("at", "") and event["at"] > cutoff:
+            continue
+        spent.update(event.get("sample_ids", []))
+    return spent
+
+
+def cmd_rolling_quota(args: argparse.Namespace) -> None:
+    from .quota import plan_source_quota
+
+    store = AuditStore(args.store)
+    plan, samples, families, rolling_events, _, _ = _load_rolling_context(store, args.plan_id)
+    quota_events = _quota_events(store, args.plan_id)
+    active = _active_quota_plan(quota_events)
+    spent = _spent_quota_ids(quota_events, args.cutoff)
+    needs = _parse_per_source_quotas(args.needs, "--needs")
+    recommendation = plan_source_quota(
+        samples=samples,
+        families=families,
+        events=rolling_events,
+        cutoff=args.cutoff,
+        needs=needs,
+        budget=args.budget,
+        spent_ids=spent,
+    )
+    selected = recommendation["strategies"][args.strategy]
+    all_satisfied = all(
+        status["gap"] == 0 for status in recommendation["source_status"].values()
+    )
+    if all_satisfied and active is None:
+        print("各来源最低需求已由既有标签或已付标注成本满足，不安排新标注")
+        _print_quota_plan(recommendation, "（无）")
+        return
+
+    if active and active.get("basis_signature") == recommendation["basis_signature"]:
+        previous = active["selected"]
+        if previous.get("strategy") == args.strategy and previous.get("sample_ids") == selected["sample_ids"]:
+            print(f"已有相同有效标注批次 {active['batch_id']}，不重复安排标注")
+            _print_quota_plan(active["recommendation"], active["batch_id"])
+            return
+
+    sequence = sum(1 for event in quota_events if event.get("type") == "plan") + 1
+    batch_id = f"q{sequence}"
+    now = utc_now()
+    if active:
+        store.append_quota_batch(args.plan_id, {
+            "type": "supersede", "batch_id": active["batch_id"], "at": now,
+            "reason": "来源撤销、身份合并或其他截点基础变化；仅作废尚未执行的选择",
+        })
+    store.append_quota_batch(args.plan_id, {
+        "type": "plan",
+        "batch_id": batch_id,
+        "cutoff": args.cutoff,
+        "needs": needs,
+        "budget": args.budget,
+        "basis_signature": recommendation["basis_signature"],
+        "selected": selected,
+        "recommendation": recommendation,
+        "created_at": now,
+    })
+    print(f"已保存下一轮核对标注批次 {batch_id}")
+    _print_quota_plan(recommendation, batch_id)
+    if not selected["feasible"]:
+        print("预算不足或候选不可用，各来源剩余缺口与原因如下：")
+        for source, reason in selected["reasons"].items():
+            print(f"  {source}: 缺 {selected['remaining_gaps'][source]}；{reason}")
+
+
+def cmd_rolling_quota_execute(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    events = _quota_events(store, args.plan_id)
+    active = _active_quota_plan(events)
+    if active is None:
+        raise SystemExit("没有可登记执行的有效标注批次")
+    planned = set(active["selected"]["sample_ids"])
+    executed_before = {
+        sid
+        for event in events
+        if event.get("type") == "execute" and event.get("batch_id") == active["batch_id"]
+        for sid in event.get("sample_ids", [])
+    }
+    requested = set(args.sample_ids or planned)
+    unknown = requested - planned
+    if unknown:
+        raise SystemExit(f"样本不在当前批次 {active['batch_id']} 中: {sorted(unknown)}")
+    new_ids = sorted(requested - executed_before)
+    if not new_ids:
+        print(f"批次 {active['batch_id']} 的这些标注成本已登记，不重复计费")
+        return
+    store.append_quota_batch(args.plan_id, {
+        "type": "execute",
+        "batch_id": active["batch_id"],
+        "sample_ids": new_ids,
+        "at": args.at or utc_now(),
+        "note": args.note,
+    })
+    print(f"已登记 {len(new_ids)} 条已付标注成本：{', '.join(new_ids)}")
+
+
+def _print_quota_plan(recommendation: dict, batch_id: str) -> None:
+    print(f"截点 {recommendation['cutoff']}，预算 {recommendation['budget']}")
+    for source, status in recommendation["source_status"].items():
+        print(
+            f"  {source}: 已有 {status['confirmed']} / 需要 {status['need']}，"
+            f"缺口 {status['gap']}；候选 {', '.join(status['pending_candidates']) or '（无）'}"
+        )
+    for key, result in recommendation["strategies"].items():
+        print(
+            f"  [{key}] 新增标注 {result['new_label_cost']}："
+            f"{', '.join(result['sample_ids']) or '（无）'}；"
+            + ("可补齐" if result["feasible"] else f"剩余缺口 {result['remaining_gaps']}")
+        )
 
 
 def cmd_rolling_review(args: argparse.Namespace) -> None:
@@ -708,6 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
     rolling_event.add_argument("--sample-ids", nargs="*", default=[])
     rolling_event.add_argument("--label-available-at", default="")
     rolling_event.add_argument("--source", default="")
+    rolling_event.add_argument("--at", default="", help="事件生效时刻；用于避免未来资料参与较早截点")
     rolling_event.add_argument("--note", default="")
     rolling_event.set_defaults(func=cmd_rolling_event)
 
@@ -733,6 +867,31 @@ def build_parser() -> argparse.ArgumentParser:
     rolling_verify.add_argument("--store", required=True)
     rolling_verify.add_argument("--plan-id", required=True)
     rolling_verify.set_defaults(func=cmd_rolling_verify)
+
+    rolling_quota = sub.add_parser(
+        "rolling-quota", help="在有限标注预算下比较来源配额补齐方案"
+    )
+    rolling_quota.add_argument("--store", required=True)
+    rolling_quota.add_argument("--plan-id", required=True)
+    rolling_quota.add_argument("--cutoff", required=True)
+    rolling_quota.add_argument("--needs", required=True, help="逐来源最低需求，如 srcA=2,srcB=1")
+    rolling_quota.add_argument("--budget", required=True, type=int)
+    rolling_quota.add_argument(
+        "--strategy",
+        choices=["minimum_new_labels", "most_shortage_first"],
+        default="minimum_new_labels",
+    )
+    rolling_quota.set_defaults(func=cmd_rolling_quota)
+
+    rolling_quota_execute = sub.add_parser(
+        "rolling-quota-execute", help="登记批次中已实际付出的标注成本"
+    )
+    rolling_quota_execute.add_argument("--store", required=True)
+    rolling_quota_execute.add_argument("--plan-id", required=True)
+    rolling_quota_execute.add_argument("--sample-ids", nargs="*", default=[])
+    rolling_quota_execute.add_argument("--at", default="")
+    rolling_quota_execute.add_argument("--note", default="")
+    rolling_quota_execute.set_defaults(func=cmd_rolling_quota_execute)
     return parser
 
 
