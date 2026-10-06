@@ -18,6 +18,14 @@
   轮次的连带影响（改善某轮泄漏可能破坏另一轮数量约束），由用户逐项
   采纳，冲突只列出、绝不静默放宽。标签更正、来源撤回或人工身份判断
   改变时列出需要重新审查的轮次，旧方案可标记限制后保留。
+- **第五轮**：有限标注预算下的来源配额补齐。按已确认标签、待标签样本
+  与每个来源的最低需求，为下一轮核对选择候选，并比较**最少新增标注**
+  与**优先补最紧缺来源**两种方案；一个样本涉及多个来源时保留其实际
+  身份关系（标注一次只消耗一份预算、计入它真正所属的来源），互斥来源
+  配额不能凭空同时补齐；人工提前可见与迟到标签各按生效时刻判定，
+  未来资料不参与较早截点的选择；来源撤销或身份合并只重算尚未执行的
+  选择，已付出的标注成本作为事实保留；预算不足时返回各来源缺口与
+  原因；保存重开后重复采用同一方案不会重复安排标注。
 
 ## 设计原则
 
@@ -163,6 +171,44 @@ python -m data_audit.cli rolling-review --store ./store --plan-id rp1
 python -m data_audit.cli rolling-restrict --store ./store --plan-id rp1 \
     --revision 1 --note 标签更正后待重审
 python -m data_audit.cli rolling-verify --store ./store --plan-id rp1
+```
+
+
+## 标注预算（第五轮）
+
+- **可见性**：已确认标签（有效标签时间不晚于截点，含人工提前可见的
+  标签更正）直接计入来源配额、不耗预算；标签晚于截点的样本是待标签
+  候选；采集晚于截点的样本属于未来资料，不参与本轮选择。
+- **身份关系**：样本可用 sources 声明实际属于多个来源，标注一次只扣
+  一份预算、按实际身份计入各来源；exclusive_sources 声明的互斥来源
+  组内，一个身份只能计入缺口最大的一侧，不能凭空同时补齐两边；
+  身份合并（identity_merged 事件或人工 duplicate 判定）后同一身份
+  标注一次即覆盖全部成员。
+- **两种方案对比**：labeling-eval 同时给出 minimal（最少新增标注，
+  优先选能补齐最多缺口来源的候选）与 neediest（优先补当前缺口最大
+  的来源）两种选择及其各自缺口；预算不足时逐来源列出缺口与原因
+  （预算用尽 / 无更多候选 / 未来样本 / 来源撤销），不静默放宽。
+- **执行与重开**：labeling-adopt 采纳一种策略生成新修订（rev_n 不可
+  覆盖）；已执行的标注是事实，来源撤销或身份合并后仅未执行的选择
+  重算（labeling-verify 会提示），已付出成本保留；重开后重复采用
+  同一方案不会重复安排标注。
+
+```bash
+# 1) 导入样本（可带 sources 多来源）并创建标注方案
+python -m data_audit.cli ingest --store ./store --version-id v1 --input data/labeling_samples.jsonl
+python -m data_audit.cli labeling-init --store ./store --version-id v1 --plan-id lp1 \
+    --cutoff 2026-02-01 --budget 3 --min-per-source srcA=2,srcB=2,srcC=1
+
+# 2) 比较两种补齐方案，采纳其一
+python -m data_audit.cli labeling-eval --store ./store --plan-id lp1
+python -m data_audit.cli labeling-adopt --store ./store --plan-id lp1 --strategy minimal
+
+# 3) 事件：人工提前可见 / 来源撤销 / 身份合并（只追加，未执行选择重算）
+python -m data_audit.cli labeling-event --store ./store --plan-id lp1 \
+    --kind label_correction --sample-ids la2 --label-available-at 2026-01-20
+python -m data_audit.cli labeling-event --store ./store --plan-id lp1 \
+    --kind identity_merged --sample-ids lf1 lf2
+python -m data_audit.cli labeling-verify --store ./store --plan-id lp1
 ```
 
 ## 使用方法

@@ -26,6 +26,9 @@ class Sample:
     collected_at: str = ""
     label_available_at: str = ""
     source: str = ""
+    # 第五轮（标注预算）：一个样本可实际属于多个来源；为空时回落到
+    # 单个 source，保留实际身份关系，不凭空增减来源。
+    sources: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -40,6 +43,7 @@ class Sample:
             collected_at=data.get("collected_at", ""),
             label_available_at=data.get("label_available_at", ""),
             source=data.get("source", ""),
+            sources=tuple(data.get("sources", ())),
         )
 
 

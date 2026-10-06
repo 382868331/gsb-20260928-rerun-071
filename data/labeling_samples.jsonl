@@ -1,0 +1,9 @@
+{"sample_id":"la1","split":"train","text":"甲一 confirmed srcA","collected_at":"2026-01-05","label_available_at":"2026-01-06","source":"srcA"}
+{"sample_id":"la2","split":"train","text":"乙二 pending srcA","collected_at":"2026-01-10","label_available_at":"2026-03-01","source":"srcA"}
+{"sample_id":"lb1","split":"train","text":"丙三 pending srcB one","collected_at":"2026-01-08","label_available_at":"2026-03-01","source":"srcB"}
+{"sample_id":"lb2","split":"train","text":"丁四 pending srcB two","collected_at":"2026-01-09","label_available_at":"2026-03-01","source":"srcB"}
+{"sample_id":"lc1","split":"train","text":"戊五 multi source pending","collected_at":"2026-01-11","label_available_at":"2026-03-01","sources":["srcA","srcC"]}
+{"sample_id":"ld1","split":"train","text":"己六 future sample","collected_at":"2026-04-01","label_available_at":"2026-04-02","source":"srcC"}
+{"sample_id":"le1","split":"train","text":"庚七 pending srcD","collected_at":"2026-01-12","label_available_at":"2026-03-01","source":"srcD"}
+{"sample_id":"lf1","split":"train","text":"辛八 merge one","collected_at":"2026-01-13","label_available_at":"2026-03-01","source":"srcE"}
+{"sample_id":"lf2","split":"train","text":"壬九 merge two","collected_at":"2026-01-14","label_available_at":"2026-03-01","source":"srcE"}

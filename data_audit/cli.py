@@ -563,6 +563,216 @@ def cmd_rolling_verify(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+
+# ---- 第五轮：有限标注预算下的来源配额补齐 ----
+
+
+def _load_labeling_context(store: AuditStore, plan_id: str):
+    if not store.has_labeling_plan(plan_id):
+        raise SystemExit(f"标注方案不存在: {plan_id}")
+    plan = store.load_labeling_plan(plan_id)
+    samples = store.load_samples(plan["version_id"])
+    decisions = store.load_active_decisions(plan["version_id"])
+    events = store.load_labeling_events(plan_id)
+    revisions = [
+        store.load_labeling_revision(plan_id, n)
+        for n in store.list_labeling_revisions(plan_id)
+    ]
+    return plan, samples, decisions, events, revisions
+
+
+def _print_labeling_evaluation(evaluation: dict) -> None:
+    print(
+        f"截点 {evaluation['cutoff']}：预算 {evaluation['budget']}，"
+        f"已付出 {evaluation['spent']}（事实保留），"
+        f"剩余 {evaluation['remaining_budget']}"
+    )
+    need = evaluation["min_per_source"]
+    have = evaluation["confirmed_per_source"]
+    pools = evaluation["source_pools"]
+    for source in sorted(need):
+        pool = pools.get(source, {})
+        parts = ", ".join(
+            f"{name}={len(pool.get(bucket, []))}"
+            for name, bucket in (
+                ("已确认", "confirmed"),
+                ("已执行", "executed"),
+                ("待标签", "pending"),
+                ("未来样本", "future"),
+                ("来源撤销", "withdrawn"),
+            )
+        )
+        print(
+            f"  来源 {source}：需求 {need[source]}，"
+            f"已计入 {have.get(source, 0)}（{parts}）"
+        )
+    names = {"minimal": "最少新增标注", "neediest": "优先补最紧缺来源"}
+    for strategy in ("minimal", "neediest"):
+        result = evaluation["strategies"][strategy]
+        chosen = ", ".join(
+            f"{entry['identity_id']}({'/'.join(entry['counts_toward'])})"
+            for entry in result["select"]
+        ) or "（无）"
+        print(f"  方案[{names[strategy]}] 新增标注 {result['cost']} 个：{chosen}")
+        for source, gap in result["gaps"].items():
+            reasons = "；".join(gap["reasons"])
+            print(
+                f"    缺口[{source}] 差 {gap['deficit']} 个"
+                f"（已有 {gap['have']}/{gap['need']}）：{reasons}"
+            )
+
+
+def cmd_labeling_init(args: argparse.Namespace) -> None:
+    from .labeling import evaluate_labeling
+
+    store = AuditStore(args.store)
+    if not store.has_version(args.version_id):
+        raise SystemExit(f"版本不存在: {args.version_id}")
+    if store.has_labeling_plan(args.plan_id):
+        raise SystemExit(f"标注方案已存在: {args.plan_id}；新方案必须使用新的 plan_id")
+    exclusive = []
+    for spec in (args.exclusive_sources or "").split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        group = sorted(s.strip() for s in spec.split(":") if s.strip())
+        if len(group) < 2:
+            raise SystemExit(
+                "--exclusive-sources 的格式应为 来源:来源，逗号分隔，"
+                f"如 srcA:srcB,srcC:srcD: {spec}"
+            )
+        exclusive.append(group)
+    plan = {
+        "plan_id": args.plan_id,
+        "version_id": args.version_id,
+        "cutoff": args.cutoff,
+        "budget": args.budget,
+        "min_per_source": _parse_per_source_quotas(
+            args.min_per_source, "--min-per-source"
+        ),
+        "exclusive_sources": exclusive,
+        "created_at": utc_now(),
+    }
+    store.save_labeling_plan(plan)
+    samples = store.load_samples(args.version_id)
+    decisions = store.load_active_decisions(args.version_id)
+    evaluation = evaluate_labeling(samples, plan, decisions)
+    print(
+        f"已保存标注方案 {args.plan_id}（数据版本 {args.version_id}，"
+        f"截点 {args.cutoff}，预算 {args.budget}）"
+    )
+    _print_labeling_evaluation(evaluation)
+
+
+def cmd_labeling_eval(args: argparse.Namespace) -> None:
+    from .labeling import evaluate_labeling
+
+    store = AuditStore(args.store)
+    plan, samples, decisions, events, revisions = _load_labeling_context(
+        store, args.plan_id
+    )
+    evaluation = evaluate_labeling(samples, plan, decisions, events, revisions)
+    print(f"标注方案 {args.plan_id}（事件 {len(events)} 条，修订 {len(revisions)} 个）")
+    _print_labeling_evaluation(evaluation)
+
+
+def cmd_labeling_adopt(args: argparse.Namespace) -> None:
+    from .labeling import evaluate_labeling
+
+    store = AuditStore(args.store)
+    plan, samples, decisions, events, revisions = _load_labeling_context(
+        store, args.plan_id
+    )
+    evaluation = evaluate_labeling(samples, plan, decisions, events, revisions)
+    selected = evaluation["strategies"][args.strategy]["select"]
+    if not selected:
+        print(
+            f"策略 {args.strategy} 没有新的标注需要安排："
+            "配额已达标或预算/候选已用尽；重复采用同一方案不会重复安排标注"
+        )
+        return
+    executed = [
+        {
+            "identity_id": entry["identity_id"],
+            "members": entry["members"],
+            "sources": entry["sources"],
+            "counts_toward": entry["counts_toward"],
+            "cost": 1,
+        }
+        for entry in selected
+    ]
+    revision = len(revisions)
+    store.save_labeling_revision(
+        args.plan_id,
+        {
+            "plan_id": args.plan_id,
+            "revision": revision,
+            "parent_revision": revision - 1 if revision else None,
+            "strategy": args.strategy,
+            "executed": executed,
+            "cost": len(executed),
+            "event_count": len(events),
+            "created_at": utc_now(),
+        },
+    )
+    print(
+        f"已按策略 {args.strategy} 安排 {len(executed)} 个新标注，"
+        f"生成修订 rev_{revision}（旧修订原样保留，成本不重复计）"
+    )
+    for entry in executed:
+        print(
+            f"  标注 {entry['identity_id']}（成员 {','.join(entry['members'])}，"
+            f"计入 {'/'.join(entry['counts_toward'])}）"
+        )
+
+
+def cmd_labeling_event(args: argparse.Namespace) -> None:
+    store = AuditStore(args.store)
+    if not store.has_labeling_plan(args.plan_id):
+        raise SystemExit(f"标注方案不存在: {args.plan_id}")
+    event = {"event": args.kind, "at": utc_now(), "note": args.note}
+    if args.kind == "label_correction":
+        if not args.sample_ids or not args.label_available_at:
+            raise SystemExit(
+                "label_correction 需要 --sample-ids 与 --label-available-at"
+            )
+        event["sample_ids"] = sorted(args.sample_ids)
+        event["label_available_at"] = args.label_available_at
+    elif args.kind == "source_withdrawn":
+        if not args.source:
+            raise SystemExit("source_withdrawn 需要 --source")
+        event["source"] = args.source
+    elif args.kind == "identity_merged":
+        if not args.sample_ids or len(args.sample_ids) < 2:
+            raise SystemExit("identity_merged 需要至少两个 --sample-ids")
+        event["sample_ids"] = sorted(args.sample_ids)
+    store.append_labeling_event(args.plan_id, event)
+    print(
+        f"已追加事件 {args.kind}（事件日志只追加；"
+        "已执行的标注成本作为事实保留，仅未执行的选择需要重新评估）"
+    )
+
+
+def cmd_labeling_verify(args: argparse.Namespace) -> None:
+    from .labeling import verify_labeling
+
+    store = AuditStore(args.store)
+    plan, samples, decisions, events, revisions = _load_labeling_context(
+        store, args.plan_id
+    )
+    result = verify_labeling(samples, plan, decisions, events, revisions)
+    print(f"核对标注方案 {args.plan_id}：" + ("一致" if result["ok"] else "不一致"))
+    for mismatch in result["mismatches"]:
+        print(f"  不一致: {mismatch}")
+    print(
+        f"已付出成本 {result['spent']}（事实保留），"
+        f"剩余预算 {result['remaining_budget']}"
+    )
+    if not result["ok"]:
+        raise SystemExit(1)
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data-audit", description="训练数据审查系统")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -733,6 +943,66 @@ def build_parser() -> argparse.ArgumentParser:
     rolling_verify.add_argument("--store", required=True)
     rolling_verify.add_argument("--plan-id", required=True)
     rolling_verify.set_defaults(func=cmd_rolling_verify)
+
+    labeling_init = sub.add_parser(
+        "labeling-init", help="创建标注预算方案（截点 + 逐来源最低需求 + 预算）"
+    )
+    labeling_init.add_argument("--store", required=True)
+    labeling_init.add_argument("--version-id", required=True)
+    labeling_init.add_argument("--plan-id", required=True)
+    labeling_init.add_argument("--cutoff", required=True, help="下一轮核对截点")
+    labeling_init.add_argument("--budget", required=True, type=int, help="标注预算")
+    labeling_init.add_argument(
+        "--min-per-source", required=True,
+        help="逐来源最低需求，如 srcA=2,srcB=1",
+    )
+    labeling_init.add_argument(
+        "--exclusive-sources", default="",
+        help="互斥来源组，如 srcA:srcB,srcC:srcD；"
+             "同一身份不能凭空同时补齐互斥配额",
+    )
+    labeling_init.set_defaults(func=cmd_labeling_init)
+
+    labeling_eval = sub.add_parser(
+        "labeling-eval", help="比较两种补齐策略的选择与缺口"
+    )
+    labeling_eval.add_argument("--store", required=True)
+    labeling_eval.add_argument("--plan-id", required=True)
+    labeling_eval.set_defaults(func=cmd_labeling_eval)
+
+    labeling_adopt = sub.add_parser(
+        "labeling-adopt", help="采纳一种策略，生成新修订（不重复安排）"
+    )
+    labeling_adopt.add_argument("--store", required=True)
+    labeling_adopt.add_argument("--plan-id", required=True)
+    labeling_adopt.add_argument(
+        "--strategy", required=True, choices=["minimal", "neediest"],
+        help="minimal=最少新增标注；neediest=优先补最紧缺来源",
+    )
+    labeling_adopt.set_defaults(func=cmd_labeling_adopt)
+
+    labeling_event = sub.add_parser(
+        "labeling-event", help="追加标签更正/来源撤销/身份合并事件"
+    )
+    labeling_event.add_argument("--store", required=True)
+    labeling_event.add_argument("--plan-id", required=True)
+    labeling_event.add_argument(
+        "--kind", required=True,
+        choices=["label_correction", "source_withdrawn", "identity_merged"],
+    )
+    labeling_event.add_argument("--sample-ids", nargs="*", default=[])
+    labeling_event.add_argument("--label-available-at", default="")
+    labeling_event.add_argument("--source", default="")
+    labeling_event.add_argument("--note", default="")
+    labeling_event.set_defaults(func=cmd_labeling_event)
+
+    labeling_verify = sub.add_parser(
+        "labeling-verify", help="重开核对：已执行成本保留，未执行选择重算"
+    )
+    labeling_verify.add_argument("--store", required=True)
+    labeling_verify.add_argument("--plan-id", required=True)
+    labeling_verify.set_defaults(func=cmd_labeling_verify)
+
     return parser
 
 

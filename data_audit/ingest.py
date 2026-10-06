@@ -36,6 +36,7 @@ def load_dataset(path: str | Path) -> list[Sample]:
                     collected_at=str(row.get("collected_at", "")),
                     label_available_at=str(row.get("label_available_at", "")),
                     source=str(row.get("source", "")),
+                    sources=tuple(str(s) for s in row.get("sources", ())),
                 )
             )
     return samples

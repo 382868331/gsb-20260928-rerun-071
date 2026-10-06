@@ -352,6 +352,62 @@ class AuditStore:
             return []
         return self._read_jsonl(path)
 
+    # ---- 标注预算方案（第五轮）----
+    # labeling/<plan_id>/plan.json     方案定义（不可覆盖）
+    # labeling/<plan_id>/rev_<n>.json  每次采纳生成一个新修订（不可覆盖）；
+    #                                  已执行标注是事实，成本保留
+    # labeling/<plan_id>/events.jsonl  标签更正/来源撤销/身份合并事件（只追加）
+
+    def _labeling_plan_dir(self, plan_id: str) -> Path:
+        return self.root / "labeling" / plan_id
+
+    def save_labeling_plan(self, plan: dict) -> None:
+        plan_dir = self._labeling_plan_dir(plan["plan_id"])
+        plan_dir.mkdir(parents=True, exist_ok=False)
+        self._write_json(plan_dir / "plan.json", plan)
+
+    def has_labeling_plan(self, plan_id: str) -> bool:
+        return (self._labeling_plan_dir(plan_id) / "plan.json").exists()
+
+    def load_labeling_plan(self, plan_id: str) -> dict:
+        return self._read_json(self._labeling_plan_dir(plan_id) / "plan.json")
+
+    def save_labeling_revision(self, plan_id: str, record: dict) -> None:
+        path = self._labeling_plan_dir(plan_id) / f"rev_{record['revision']}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"标注方案修订已存在: {path.name}；新的采纳必须产生新的修订号"
+            )
+        self._write_json(path, record)
+
+    def list_labeling_revisions(self, plan_id: str) -> list[int]:
+        plan_dir = self._labeling_plan_dir(plan_id)
+        if not plan_dir.exists():
+            return []
+        return sorted(
+            int(path.stem.split("_", 1)[1])
+            for path in plan_dir.glob("rev_*.json")
+        )
+
+    def load_labeling_revision(self, plan_id: str, revision: int) -> dict:
+        return self._read_json(
+            self._labeling_plan_dir(plan_id) / f"rev_{revision}.json"
+        )
+
+    def _labeling_events_path(self, plan_id: str) -> Path:
+        return self._labeling_plan_dir(plan_id) / "events.jsonl"
+
+    def append_labeling_event(self, plan_id: str, event: dict) -> None:
+        path = self._labeling_events_path(plan_id)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_labeling_events(self, plan_id: str) -> list[dict]:
+        path = self._labeling_events_path(plan_id)
+        if not path.exists():
+            return []
+        return self._read_jsonl(path)
+
     # ---- 索引与基础 IO ----
 
     def _load_index(self) -> dict:
